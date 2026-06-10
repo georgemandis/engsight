@@ -17,6 +17,8 @@ usage() {
   echo "  log              Show recent events across all repos"
   echo "  repos            List repos with activity counts"
   echo "  summary          Summarize activity for a time period"
+  echo "  sessions         Reconstruct work sessions from event clusters"
+  echo "  patterns         Surface working patterns and insights"
   echo ""
   echo "Options for log:"
   echo "  --repo NAME      Filter by repo name"
@@ -30,6 +32,19 @@ usage() {
   echo "Options for summary:"
   echo "  --daily          Summarize today"
   echo "  --weekly         Summarize last 7 days (default)"
+  echo "  --since DATE     Custom start date (YYYY-MM-DD)"
+  echo "  --until DATE     Custom end date (YYYY-MM-DD, default: today)"
+  echo ""
+  echo "Options for sessions:"
+  echo "  --since DATE     Show sessions after DATE"
+  echo "  --until DATE     Show sessions before DATE"
+  echo "  --gap MINUTES    Gap threshold for session boundary (default: 30)"
+  echo "  --repo NAME      Filter by repo name"
+  echo "  --limit N        Max sessions to show (default: 20)"
+  echo ""
+  echo "Options for patterns:"
+  echo "  --daily          Analyze today"
+  echo "  --weekly         Analyze last 7 days (default)"
   echo "  --since DATE     Custom start date (YYYY-MM-DD)"
   echo "  --until DATE     Custom end date (YYYY-MM-DD, default: today)"
   echo ""
@@ -146,10 +161,29 @@ cmd_status() {
 if date -v +0d >/dev/null 2>&1; then
   # BSD date (macOS)
   _engsight_date_ago() { date -v-"$1"d +"%Y-%m-%d"; }
+  _engsight_to_epoch() { date -j -f "%Y-%m-%dT%H:%M:%SZ" "$1" "+%s" 2>/dev/null || echo 0; }
 else
   # GNU date
   _engsight_date_ago() { date -d "$1 days ago" +"%Y-%m-%d"; }
+  _engsight_to_epoch() { date -d "$1" "+%s" 2>/dev/null || echo 0; }
 fi
+
+_engsight_format_duration() {
+  local seconds="$1"
+  if [[ "$seconds" -lt 60 ]]; then
+    printf '%ds' "$seconds"
+  elif [[ "$seconds" -lt 3600 ]]; then
+    printf '%dm' $(( seconds / 60 ))
+  else
+    local h=$(( seconds / 3600 ))
+    local m=$(( (seconds % 3600) / 60 ))
+    if [[ "$m" -gt 0 ]]; then
+      printf '%dh %dm' "$h" "$m"
+    else
+      printf '%dh' "$h"
+    fi
+  fi
+}
 
 # --- Query helpers ---
 
@@ -484,6 +518,465 @@ cmd_summary() {
   fi
 }
 
+# --- sessions command ---
+
+cmd_sessions() {
+  _engsight_check_db
+
+  local since="" until_date="" gap=30 repo="" limit=20
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since)    since="$2"; shift 2 ;;
+      --until)    until_date="$2"; shift 2 ;;
+      --gap)      gap="$2"; shift 2 ;;
+      --repo)     repo="$2"; shift 2 ;;
+      --limit)    limit="$2"; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      *)          echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  [[ -z "$since" ]] && since="$(_engsight_date_ago 7)"
+  [[ -z "$until_date" ]] && until_date="$(_engsight_date_ago 0)"
+
+  local ts_start="${since}T00:00:00Z"
+  local ts_end="${until_date}T23:59:59Z"
+  local where="timestamp >= '${ts_start}' AND timestamp <= '${ts_end}'"
+  [[ -n "$repo" ]] && where="${where} AND repo_name='${repo}'"
+
+  local gap_seconds=$(( gap * 60 ))
+
+  # Pull all events sorted by time
+  local events_data
+  events_data="$(sqlite3 "$DB" "SELECT timestamp, event_type, repo_name, branch, json_extract(payload, '$.ai_commit_signals.co_authored_by') FROM events WHERE ${where} ORDER BY timestamp ASC;")"
+
+  if [[ -z "$events_data" ]]; then
+    echo "No events from ${since} to ${until_date}."
+    return
+  fi
+
+  # Walk events and group into sessions
+  local sessions=()
+  local s_start="" s_end="" s_repos="" s_branches="" s_commits=0 s_events=0
+  local s_checkouts=0 s_ai_commits=0 s_prev_epoch=0
+
+  _flush_session() {
+    if [[ -z "$s_start" ]]; then return; fi
+    local s_start_epoch s_end_epoch duration
+    s_start_epoch="$(_engsight_to_epoch "$s_start")"
+    s_end_epoch="$(_engsight_to_epoch "$s_end")"
+    duration=$(( s_end_epoch - s_start_epoch ))
+    # Deduplicate repos and branches
+    local repo_list branch_list repo_count
+    repo_list="$(echo "$s_repos" | tr ',' '\n' | sort -u | paste -sd',' -)"
+    branch_list="$(echo "$s_branches" | tr ',' '\n' | sort -u | paste -sd',' -)"
+    repo_count="$(echo "$repo_list" | tr ',' '\n' | wc -l | tr -d ' ')"
+    sessions+=("${s_start}|${s_end}|${duration}|${repo_list}|${repo_count}|${s_commits}|${s_checkouts}|${s_ai_commits}|${s_events}|${branch_list}")
+  }
+
+  while IFS='|' read -r ts etype rname branch ai_coauthors; do
+    local epoch
+    epoch="$(_engsight_to_epoch "$ts")"
+
+    # Check if this starts a new session
+    if [[ -z "$s_start" ]] || [[ $(( epoch - s_prev_epoch )) -gt $gap_seconds ]]; then
+      _flush_session
+      s_start="$ts"
+      s_end="$ts"
+      s_repos="$rname"
+      s_branches="$branch"
+      s_commits=0
+      s_events=0
+      s_checkouts=0
+      s_ai_commits=0
+    else
+      s_end="$ts"
+      s_repos="${s_repos},${rname}"
+      s_branches="${s_branches},${branch}"
+    fi
+
+    s_events=$(( s_events + 1 ))
+    s_prev_epoch="$epoch"
+
+    if [[ "$etype" == "commit" ]]; then
+      s_commits=$(( s_commits + 1 ))
+      if [[ -n "$ai_coauthors" && "$ai_coauthors" != "[]" ]]; then
+        s_ai_commits=$(( s_ai_commits + 1 ))
+      fi
+    fi
+    if [[ "$etype" == "checkout" ]]; then
+      s_checkouts=$(( s_checkouts + 1 ))
+    fi
+  done <<< "$events_data"
+  _flush_session
+
+  local total_sessions=${#sessions[@]}
+  if [[ "$total_sessions" -eq 0 ]]; then
+    echo "No sessions reconstructed."
+    return
+  fi
+
+  echo "Sessions: ${total_sessions} (gap threshold: ${gap}m)"
+  echo "Period: ${since} to ${until_date}"
+  echo ""
+  printf "%-17s %8s %6s %8s %4s %s\n" "Start" "Duration" "Cmts" "Switches" "AI" "Repos"
+  printf "%s\n" "────────────────────────────────────────────────────────────────────────────────────"
+
+  # Show sessions in reverse chronological order, limited
+  local shown=0
+  for (( i=${#sessions[@]}-1; i>=0; i-- )); do
+    if [[ "$shown" -ge "$limit" ]]; then break; fi
+    IFS='|' read -r ss_start ss_end ss_dur ss_repos ss_rcount ss_commits ss_checkouts ss_ai ss_events ss_branches <<< "${sessions[$i]}"
+
+    local display_start="${ss_start%:*}"
+    display_start="${display_start/T/ }"
+    local dur_display
+    dur_display="$(_engsight_format_duration "$ss_dur")"
+
+    local ai_indicator=""
+    if [[ "$ss_ai" -gt 0 ]]; then
+      ai_indicator="${ss_ai}"
+    else
+      ai_indicator="-"
+    fi
+
+    # Truncate repo list if too long
+    local repo_display="$ss_repos"
+    if [[ ${#repo_display} -gt 35 ]]; then
+      repo_display="${repo_display:0:32}..."
+    fi
+
+    printf "%-17s %8s %6d %8d %4s %s\n" "$display_start" "$dur_display" "$ss_commits" "$ss_checkouts" "$ai_indicator" "$repo_display"
+    shown=$(( shown + 1 ))
+  done
+
+  if [[ "$total_sessions" -gt "$limit" ]]; then
+    echo ""
+    echo "Showing ${limit} of ${total_sessions} sessions. Use --limit to see more."
+  fi
+}
+
+# --- patterns command ---
+
+cmd_patterns() {
+  _engsight_check_db
+
+  local since="" until_date="" mode="weekly" gap=30
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --daily)    mode="daily"; shift ;;
+      --weekly)   mode="weekly"; shift ;;
+      --since)    since="$2"; mode="custom"; shift 2 ;;
+      --until)    until_date="$2"; shift 2 ;;
+      --gap)      gap="$2"; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      *)          echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  case "$mode" in
+    daily)   since="$(_engsight_date_ago 0)"; until_date="$(_engsight_date_ago 0)" ;;
+    weekly)  since="$(_engsight_date_ago 7)"; until_date="$(_engsight_date_ago 0)" ;;
+    custom)
+      [[ -z "$since" ]] && { echo "Error: --since required" >&2; exit 1; }
+      [[ -z "$until_date" ]] && until_date="$(_engsight_date_ago 0)"
+      ;;
+  esac
+
+  local ts_start="${since}T00:00:00Z"
+  local ts_end="${until_date}T23:59:59Z"
+  local where="timestamp >= '${ts_start}' AND timestamp <= '${ts_end}'"
+  local gap_seconds=$(( gap * 60 ))
+
+  local total_events
+  total_events="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where};")"
+
+  if [[ "$total_events" -eq 0 ]]; then
+    echo "No activity from ${since} to ${until_date}."
+    return
+  fi
+
+  local commits
+  commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit';")"
+
+  echo "Patterns: ${since} to ${until_date}"
+  printf "%s\n" "════════════════════════════════════════════════════════════"
+
+  # --- Reconstruct sessions for analysis ---
+  local events_data
+  events_data="$(sqlite3 "$DB" "SELECT timestamp, event_type, repo_name, branch, json_extract(payload, '$.ai_commit_signals.co_authored_by'), json_extract(payload, '$.files_changed') FROM events WHERE ${where} ORDER BY timestamp ASC;")"
+
+  # Session reconstruction (same logic as cmd_sessions)
+  local -a sess_durations=() sess_commits=() sess_ai_commits=() sess_repo_counts=()
+  local -a sess_checkouts=() sess_files=() sess_repos_list=()
+  local s_start="" s_end="" s_repos="" s_commits=0 s_events=0
+  local s_checkouts=0 s_ai_commits=0 s_prev_epoch=0 s_files=0
+
+  _flush_pattern_session() {
+    if [[ -z "$s_start" ]]; then return; fi
+    local s_start_epoch s_end_epoch duration repo_count
+    s_start_epoch="$(_engsight_to_epoch "$s_start")"
+    s_end_epoch="$(_engsight_to_epoch "$s_end")"
+    duration=$(( s_end_epoch - s_start_epoch ))
+    repo_count="$(echo "$s_repos" | tr ',' '\n' | sort -u | wc -l | tr -d ' ')"
+    local repo_list
+    repo_list="$(echo "$s_repos" | tr ',' '\n' | sort -u | paste -sd',' -)"
+    sess_durations+=("$duration")
+    sess_commits+=("$s_commits")
+    sess_ai_commits+=("$s_ai_commits")
+    sess_repo_counts+=("$repo_count")
+    sess_checkouts+=("$s_checkouts")
+    sess_files+=("$s_files")
+    sess_repos_list+=("$repo_list")
+  }
+
+  while IFS='|' read -r ts etype rname branch ai_coauthors files_changed; do
+    local epoch
+    epoch="$(_engsight_to_epoch "$ts")"
+
+    if [[ -z "$s_start" ]] || [[ $(( epoch - s_prev_epoch )) -gt $gap_seconds ]]; then
+      _flush_pattern_session
+      s_start="$ts"
+      s_end="$ts"
+      s_repos="$rname"
+      s_commits=0
+      s_events=0
+      s_checkouts=0
+      s_ai_commits=0
+      s_files=0
+    else
+      s_end="$ts"
+      s_repos="${s_repos},${rname}"
+    fi
+
+    s_events=$(( s_events + 1 ))
+    s_prev_epoch="$epoch"
+
+    if [[ "$etype" == "commit" ]]; then
+      s_commits=$(( s_commits + 1 ))
+      s_files=$(( s_files + ${files_changed:-0} ))
+      if [[ -n "$ai_coauthors" && "$ai_coauthors" != "[]" ]]; then
+        s_ai_commits=$(( s_ai_commits + 1 ))
+      fi
+    fi
+    if [[ "$etype" == "checkout" ]]; then
+      s_checkouts=$(( s_checkouts + 1 ))
+    fi
+  done <<< "$events_data"
+  _flush_pattern_session
+
+  local num_sessions=${#sess_durations[@]}
+
+  # --- Context Switching ---
+  echo ""
+  echo "Context Switching"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  local multi_repo_sessions=0 total_switches=0
+  for (( i=0; i<num_sessions; i++ )); do
+    if [[ "${sess_repo_counts[$i]}" -gt 1 ]]; then
+      multi_repo_sessions=$(( multi_repo_sessions + 1 ))
+    fi
+    total_switches=$(( total_switches + ${sess_checkouts[$i]} ))
+  done
+
+  if [[ "$num_sessions" -gt 0 ]]; then
+    local multi_pct
+    multi_pct="$(awk "BEGIN { printf \"%.0f\", (${multi_repo_sessions}/${num_sessions})*100 }")"
+    printf "  • Sessions:             %d\n" "$num_sessions"
+    printf "  • Multi-repo sessions:  %d / %d (%s%%)\n" "$multi_repo_sessions" "$num_sessions" "$multi_pct"
+    printf "  • Total branch switches: %d\n" "$total_switches"
+    if [[ "$num_sessions" -gt 0 ]]; then
+      local avg_switches
+      avg_switches="$(awk "BEGIN { printf \"%.1f\", ${total_switches}/${num_sessions} }")"
+      printf "  • Avg switches/session: %s\n" "$avg_switches"
+    fi
+  fi
+
+  # --- Commit Cadence ---
+  echo ""
+  echo "Commit Cadence"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  if [[ "$commits" -gt 1 ]]; then
+    # Get time-since-last-commit values (repo-scoped)
+    local cadence_data
+    cadence_data="$(sqlite3 "$DB" "
+      SELECT json_extract(payload, '$.time_since_last_commit_repo_seconds')
+      FROM events WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.time_since_last_commit_repo_seconds') > 0
+      ORDER BY 1;" 2>/dev/null)"
+
+    if [[ -n "$cadence_data" ]]; then
+      local cadence_count median_val avg_val min_val max_val
+      cadence_count="$(echo "$cadence_data" | wc -l | tr -d ' ')"
+      min_val="$(echo "$cadence_data" | head -1)"
+      max_val="$(echo "$cadence_data" | tail -1)"
+      avg_val="$(echo "$cadence_data" | awk '{ sum += $1; n++ } END { printf "%.0f", sum/n }')"
+      # Median
+      local mid=$(( (cadence_count + 1) / 2 ))
+      median_val="$(echo "$cadence_data" | sed -n "${mid}p")"
+
+      printf "  • Commits with prior:   %d\n" "$cadence_count"
+      printf "  • Median gap:           %s\n" "$(_engsight_format_duration "$median_val")"
+      printf "  • Average gap:          %s\n" "$(_engsight_format_duration "$avg_val")"
+      printf "  • Shortest gap:         %s\n" "$(_engsight_format_duration "$min_val")"
+      printf "  • Longest gap:          %s\n" "$(_engsight_format_duration "$max_val")"
+    else
+      printf "  • Not enough sequential commits to measure cadence\n"
+    fi
+  else
+    printf "  • Need 2+ commits to measure cadence\n"
+  fi
+
+  # --- Session Depth ---
+  echo ""
+  echo "Session Depth"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  if [[ "$num_sessions" -gt 0 ]]; then
+    # Categorize sessions
+    local deep=0 moderate=0 shallow=0
+    local total_duration=0 sessions_with_commits=0
+    for (( i=0; i<num_sessions; i++ )); do
+      total_duration=$(( total_duration + ${sess_durations[$i]} ))
+      if [[ "${sess_commits[$i]}" -gt 0 ]]; then
+        sessions_with_commits=$(( sessions_with_commits + 1 ))
+      fi
+      # Deep: single repo, 30+ min, 3+ commits
+      if [[ "${sess_repo_counts[$i]}" -eq 1 && "${sess_durations[$i]}" -ge 1800 && "${sess_commits[$i]}" -ge 3 ]]; then
+        deep=$(( deep + 1 ))
+      # Shallow: <10 min or 0-1 commits
+      elif [[ "${sess_durations[$i]}" -lt 600 || "${sess_commits[$i]}" -le 1 ]]; then
+        shallow=$(( shallow + 1 ))
+      else
+        moderate=$(( moderate + 1 ))
+      fi
+    done
+
+    local avg_duration
+    avg_duration="$(awk "BEGIN { printf \"%.0f\", ${total_duration}/${num_sessions} }")"
+
+    printf "  • Deep work (1 repo, 30m+, 3+ commits): %d sessions\n" "$deep"
+    printf "  • Moderate:                              %d sessions\n" "$moderate"
+    printf "  • Shallow (<10m or 0-1 commits):         %d sessions\n" "$shallow"
+    printf "  • Average session duration:              %s\n" "$(_engsight_format_duration "$avg_duration")"
+    printf "  • Total time in sessions:                %s\n" "$(_engsight_format_duration "$total_duration")"
+  fi
+
+  # --- AI Correlation ---
+  echo ""
+  echo "AI Correlation"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  if [[ "$num_sessions" -gt 0 ]]; then
+    local ai_sessions=0 solo_sessions=0
+    local ai_total_commits=0 solo_total_commits=0
+    local ai_total_files=0 solo_total_files=0
+    local ai_total_duration=0 solo_total_duration=0
+
+    for (( i=0; i<num_sessions; i++ )); do
+      if [[ "${sess_ai_commits[$i]}" -gt 0 ]]; then
+        ai_sessions=$(( ai_sessions + 1 ))
+        ai_total_commits=$(( ai_total_commits + ${sess_commits[$i]} ))
+        ai_total_files=$(( ai_total_files + ${sess_files[$i]} ))
+        ai_total_duration=$(( ai_total_duration + ${sess_durations[$i]} ))
+      elif [[ "${sess_commits[$i]}" -gt 0 ]]; then
+        solo_sessions=$(( solo_sessions + 1 ))
+        solo_total_commits=$(( solo_total_commits + ${sess_commits[$i]} ))
+        solo_total_files=$(( solo_total_files + ${sess_files[$i]} ))
+        solo_total_duration=$(( solo_total_duration + ${sess_durations[$i]} ))
+      fi
+    done
+
+    printf "  • AI-assisted sessions: %d\n" "$ai_sessions"
+    printf "  • Solo sessions:        %d\n" "$solo_sessions"
+
+    if [[ "$ai_sessions" -gt 0 && "$solo_sessions" -gt 0 ]]; then
+      local ai_avg_commits solo_avg_commits ai_avg_files solo_avg_files
+      local ai_avg_duration solo_avg_duration
+      ai_avg_commits="$(awk "BEGIN { printf \"%.1f\", ${ai_total_commits}/${ai_sessions} }")"
+      solo_avg_commits="$(awk "BEGIN { printf \"%.1f\", ${solo_total_commits}/${solo_sessions} }")"
+      ai_avg_files="$(awk "BEGIN { printf \"%.1f\", ${ai_total_files}/${ai_sessions} }")"
+      solo_avg_files="$(awk "BEGIN { printf \"%.1f\", ${solo_total_files}/${solo_sessions} }")"
+      ai_avg_duration="$(awk "BEGIN { printf \"%.0f\", ${ai_total_duration}/${ai_sessions} }")"
+      solo_avg_duration="$(awk "BEGIN { printf \"%.0f\", ${solo_total_duration}/${solo_sessions} }")"
+
+      echo ""
+      printf "  %-28s %10s %10s\n" "" "AI" "Solo"
+      printf "  %-28s %10s %10s\n" "────────────────────────────" "──────────" "──────────"
+      printf "  %-28s %10s %10s\n" "Avg commits/session" "$ai_avg_commits" "$solo_avg_commits"
+      printf "  %-28s %10s %10s\n" "Avg files changed/session" "$ai_avg_files" "$solo_avg_files"
+      printf "  %-28s %10s %10s\n" "Avg session duration" "$(_engsight_format_duration "$ai_avg_duration")" "$(_engsight_format_duration "$solo_avg_duration")"
+    elif [[ "$ai_sessions" -eq 0 && "$solo_sessions" -eq 0 ]]; then
+      printf "  • No commit sessions to compare\n"
+    else
+      printf "  • Need both AI and solo sessions to compare\n"
+    fi
+  fi
+
+  # --- Breadth ---
+  echo ""
+  echo "Breadth"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  local unique_repos unique_branches
+  unique_repos="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT repo_name) FROM events WHERE ${where};")"
+  unique_branches="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT repo_name || '/' || branch) FROM events WHERE ${where};")"
+
+  printf "  • Unique repos:         %d\n" "$unique_repos"
+  printf "  • Unique branches:      %d (across all repos)\n" "$unique_branches"
+
+  # Focus ratio: % of commits in top repo
+  if [[ "$commits" -gt 0 ]]; then
+    local top_repo top_commits
+    top_repo="$(sqlite3 "$DB" "SELECT repo_name FROM events WHERE ${where} AND event_type='commit' GROUP BY repo_name ORDER BY COUNT(*) DESC LIMIT 1;")"
+    top_commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND repo_name='${top_repo}';")"
+    local focus_pct
+    focus_pct="$(awk "BEGIN { printf \"%.0f\", (${top_commits}/${commits})*100 }")"
+    printf "  • Focus ratio:          %s%% of commits in %s\n" "$focus_pct" "$top_repo"
+
+    if [[ "$focus_pct" -ge 80 ]]; then
+      printf "  • Assessment:           Focused — most work in one repo\n"
+    elif [[ "$focus_pct" -ge 50 ]]; then
+      printf "  • Assessment:           Balanced — primary repo with exploration\n"
+    else
+      printf "  • Assessment:           Spread — work distributed across repos\n"
+    fi
+  fi
+
+  # File type diversity
+  local file_types
+  file_types="$(sqlite3 "$DB" "
+    SELECT DISTINCT key FROM events,
+      json_each(json_extract(payload, '$.file_types'))
+    WHERE ${where} AND event_type='commit'
+    AND key != '(none)';" 2>/dev/null || echo "")"
+
+  if [[ -n "$file_types" ]]; then
+    local type_count
+    type_count="$(echo "$file_types" | wc -l | tr -d ' ')"
+    local type_list
+    type_list="$(echo "$file_types" | sort | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')"
+    printf "  • File types touched:   %d (%s)\n" "$type_count" "$type_list"
+  fi
+
+  # Daily repo spread (how many repos per day)
+  if [[ "$mode" != "daily" ]]; then
+    echo ""
+    echo "  Daily repo spread:"
+    sqlite3 "$DB" "
+      SELECT date(timestamp) as day, COUNT(DISTINCT repo_name) as repos,
+        SUM(CASE WHEN event_type='commit' THEN 1 ELSE 0 END) as commits
+      FROM events WHERE ${where}
+      GROUP BY day ORDER BY day;" | while IFS='|' read -r day drepos dcommits; do
+      printf "    %s: %d repos, %d commits\n" "$day" "$drepos" "$dcommits"
+    done
+  fi
+}
+
 # --- Main ---
 COMMAND="${1:-}"
 [[ -n "$COMMAND" ]] && shift
@@ -495,6 +988,8 @@ case "$COMMAND" in
   log)        cmd_log "$@" ;;
   repos)      cmd_repos "$@" ;;
   summary)    cmd_summary "$@" ;;
+  sessions)   cmd_sessions "$@" ;;
+  patterns)   cmd_patterns "$@" ;;
   -h|--help|"") usage ;;
   *)
     echo "Unknown command: $COMMAND" >&2

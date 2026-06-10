@@ -119,6 +119,27 @@ engsight summary --since 2025-01-01 --until 2025-01-31  # Custom range
 
 The summary includes: repos touched, commit/push/merge/checkout counts, AI co-authorship breakdown by tool and pattern, AI artifact presence, and time-of-day/weekday patterns.
 
+### sessions
+
+```bash
+engsight sessions                     # Sessions from last 7 days
+engsight sessions --since 2025-01-01  # Sessions after a date
+engsight sessions --gap 60            # Use 60-minute gap threshold (default: 30)
+engsight sessions --repo myproject    # Filter by repo
+```
+
+Reconstructs work sessions by clustering events with gaps shorter than the threshold. Shows duration, commit count, branch switches, AI usage, and repos involved.
+
+### patterns
+
+```bash
+engsight patterns --daily             # Today's patterns
+engsight patterns --weekly            # Last 7 days (default)
+engsight patterns --since 2025-01-01  # Custom start date
+```
+
+Surfaces working patterns: context switching frequency, commit cadence (median/average gap between commits), session depth (deep work vs. shallow), AI-assisted vs. solo session comparison, and breadth of work (focus ratio, file type diversity, daily repo spread).
+
 ## Configuration
 
 Edit `~/.engsight/config` to customize:
