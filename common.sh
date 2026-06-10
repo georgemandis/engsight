@@ -250,9 +250,33 @@ engsight_scan_ai_commit_signals() {
 }
 
 # --- Process Sniffing ---
+#
+# Three tiers:
+#   ENGSIGHT_PROCESS_SNIFF=false  — disabled (default)
+#   ENGSIGHT_PROCESS_SNIFF=true   — Tier 1+2: detect presence + ps stats (~50ms)
+#   ENGSIGHT_PROCESS_SNIFF=deep   — Tier 3: adds lsof for open files + network (~200ms)
+
+# Convert elapsed time string to seconds
+# Formats: MM:SS, HH:MM:SS, D-HH:MM:SS
+_engsight_etime_to_seconds() {
+  local etime="$1"
+  local seconds=0
+  if [[ "$etime" == *-* ]]; then
+    local days="${etime%%-*}" rest="${etime##*-}"
+    IFS=: read -r h m s <<< "$rest"
+    seconds=$(( 10#${days:-0}*86400 + 10#${h:-0}*3600 + 10#${m:-0}*60 + 10#${s:-0} )) 2>/dev/null || seconds=0
+  elif [[ "$(echo "$etime" | tr -cd ':' | wc -c | tr -d ' ')" -eq 2 ]]; then
+    IFS=: read -r h m s <<< "$etime"
+    seconds=$(( 10#${h:-0}*3600 + 10#${m:-0}*60 + 10#${s:-0} )) 2>/dev/null || seconds=0
+  else
+    IFS=: read -r m s <<< "$etime"
+    seconds=$(( 10#${m:-0}*60 + 10#${s:-0} )) 2>/dev/null || seconds=0
+  fi
+  echo "$seconds"
+}
 
 engsight_process_snapshot() {
-  if [[ "$ENGSIGHT_PROCESS_SNIFF" != "true" ]]; then
+  if [[ "$ENGSIGHT_PROCESS_SNIFF" != "true" && "$ENGSIGHT_PROCESS_SNIFF" != "deep" ]]; then
     printf '%s' '{"active_ai_tools":[]}'
     return
   fi
@@ -263,56 +287,50 @@ engsight_process_snapshot() {
   local first=true
 
   for proc_name in "${ENGSIGHT_PROCESS_NAMES[@]}"; do
+    # Tier 1: exact match only — no fuzzy fallback
     local pids
     pids="$(pgrep -x "$proc_name" 2>/dev/null)"
-    if [[ -z "$pids" ]]; then
-      # Try case-insensitive and partial match
-      pids="$(pgrep -if "$proc_name" 2>/dev/null | head -5)"
-    fi
     if [[ -z "$pids" ]]; then continue; fi
 
-    while IFS= read -r pid; do
-      [[ -z "$pid" ]] && continue
+    local instance_count
+    instance_count="$(echo "$pids" | wc -l | tr -d ' ')"
+    local pid_list
+    pid_list="$(echo "$pids" | paste -sd',' -)"
 
-      local uptime_seconds="" cpu_percent="" memory_mb=""
-      local open_files_json="[]" open_ports_json="[]"
+    # Tier 2: ps stats for all PIDs at once
+    local total_cpu=0 total_mem_kb=0 max_uptime=0
+    while IFS= read -r ps_line; do
+      [[ -z "$ps_line" ]] && continue
+      local pid etime pcpu rss
+      pid="$(echo "$ps_line" | awk '{print $1}')"
+      etime="$(echo "$ps_line" | awk '{print $2}')"
+      pcpu="$(echo "$ps_line" | awk '{print $3}')"
+      rss="$(echo "$ps_line" | awk '{print $4}')"
 
-      # ps info: elapsed time, CPU, RSS
-      local ps_out
-      ps_out="$(ps -p "$pid" -o etime=,pcpu=,rss= 2>/dev/null | head -1 | xargs)"
-      if [[ -n "$ps_out" ]]; then
-        local etime pcpu rss
-        etime="$(echo "$ps_out" | awk '{print $1}')"
-        pcpu="$(echo "$ps_out" | awk '{print $2}')"
-        rss="$(echo "$ps_out" | awk '{print $3}')"
+      local up
+      up="$(_engsight_etime_to_seconds "$etime")"
+      if [[ "$up" -gt "$max_uptime" ]]; then max_uptime="$up"; fi
 
-        # Convert etime to seconds (formats: MM:SS, HH:MM:SS, D-HH:MM:SS)
-        # Use 10# prefix everywhere to avoid octal interpretation of zero-padded numbers
-        uptime_seconds=0
-        if [[ "$etime" == *-* ]]; then
-          local days rest
-          days="${etime%%-*}"
-          rest="${etime##*-}"
-          IFS=: read -r h m s <<< "$rest"
-          uptime_seconds=$(( 10#${days:-0}*86400 + 10#${h:-0}*3600 + 10#${m:-0}*60 + 10#${s:-0} )) 2>/dev/null || uptime_seconds=0
-        elif [[ "$(echo "$etime" | tr -cd ':' | wc -c | tr -d ' ')" -eq 2 ]]; then
-          IFS=: read -r h m s <<< "$etime"
-          uptime_seconds=$(( 10#${h:-0}*3600 + 10#${m:-0}*60 + 10#${s:-0} )) 2>/dev/null || uptime_seconds=0
-        else
-          IFS=: read -r m s <<< "$etime"
-          uptime_seconds=$(( 10#${m:-0}*60 + 10#${s:-0} )) 2>/dev/null || uptime_seconds=0
-        fi
+      # Accumulate CPU (awk for float addition)
+      total_cpu="$(awk "BEGIN { printf \"%.1f\", ${total_cpu} + ${pcpu:-0} }")"
+      total_mem_kb=$(( total_mem_kb + ${rss:-0} ))
+    done < <(ps -p "$pid_list" -o pid=,etime=,pcpu=,rss= 2>/dev/null)
 
-        cpu_percent="$pcpu"
-        if [[ -n "$rss" ]]; then
-          memory_mb="$(( rss / 1024 ))"
-        fi
-      fi
+    local total_mem_mb=$(( total_mem_kb / 1024 ))
 
-      # lsof: open files in repo + network connections
-      if [[ -n "$repo_root" ]]; then
+    # Build the tool JSON
+    local tool_json="{\"name\":\"${proc_name}\",\"instances\":${instance_count},\"max_uptime_seconds\":${max_uptime},\"total_cpu_percent\":\"${total_cpu}\",\"total_memory_mb\":${total_mem_mb}"
+
+    # Tier 3: lsof for open files in repo + network (only in deep mode)
+    if [[ "$ENGSIGHT_PROCESS_SNIFF" == "deep" ]]; then
+      local lsof_output
+      lsof_output="$(lsof -p "$pid_list" 2>/dev/null)"
+
+      # Files open in this repo
+      local open_files_json="[]"
+      if [[ -n "$repo_root" && -n "$lsof_output" ]]; then
         local repo_files
-        repo_files="$(lsof -p "$pid" 2>/dev/null | grep "$repo_root" | awk '{print $NF}' | sort -u | head -20)"
+        repo_files="$(echo "$lsof_output" | grep "$repo_root" | awk '{print $NF}' | sort -u | head -20)"
         if [[ -n "$repo_files" ]]; then
           open_files_json="["
           local ff=true
@@ -326,23 +344,31 @@ engsight_process_snapshot() {
         fi
       fi
 
-      local net_conns
-      net_conns="$(lsof -p "$pid" -i 2>/dev/null | grep -v "^COMMAND" | awk '{print $9}' | sort -u | head -10)"
-      if [[ -n "$net_conns" ]]; then
-        open_ports_json="["
-        local pf=true
-        while IFS= read -r conn; do
-          if [[ "$pf" != "true" ]]; then open_ports_json+=","; fi
-          open_ports_json+="\"$(engsight_json_escape "$conn")\""
-          pf=false
-        done <<< "$net_conns"
-        open_ports_json+="]"
+      # Network connections
+      local open_ports_json="[]"
+      if [[ -n "$lsof_output" ]]; then
+        local net_conns
+        net_conns="$(echo "$lsof_output" | awk '$5 ~ /IPv[46]/ {print $9}' | sort -u | head -10)"
+        if [[ -n "$net_conns" ]]; then
+          open_ports_json="["
+          local pf=true
+          while IFS= read -r conn; do
+            if [[ "$pf" != "true" ]]; then open_ports_json+=","; fi
+            open_ports_json+="\"$(engsight_json_escape "$conn")\""
+            pf=false
+          done <<< "$net_conns"
+          open_ports_json+="]"
+        fi
       fi
 
-      if [[ "$first" != "true" ]]; then tools+=","; fi
-      tools+="{\"name\":\"${proc_name}\",\"pid\":${pid},\"uptime_seconds\":${uptime_seconds:-0},\"cpu_percent\":\"${cpu_percent:-0}\",\"memory_mb\":${memory_mb:-0},\"open_files_in_repo\":${open_files_json},\"open_ports\":${open_ports_json}}"
-      first=false
-    done <<< "$pids"
+      tool_json+=",\"open_files_in_repo\":${open_files_json},\"open_ports\":${open_ports_json}"
+    fi
+
+    tool_json+="}"
+
+    if [[ "$first" != "true" ]]; then tools+=","; fi
+    tools+="$tool_json"
+    first=false
   done
 
   printf '{"active_ai_tools":[%s]}' "$tools"
