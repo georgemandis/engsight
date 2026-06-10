@@ -17,10 +17,11 @@
 
 ## Phase 1: Query & Explore
 
-- [ ] Basic query scripts (`engsight log`, `engsight summary`, `engsight repos`)
-- [ ] Weekly/monthly summary generation (markdown output)
-- [ ] Simple report: "what did I work on this week?"
+- [x] Basic query scripts (`engsight log`, `engsight summary`, `engsight repos`)
+- [x] Weekly/daily/custom summary generation
+- [x] Simple report: "what did I work on this week?" (`engsight summary --weekly`)
 - [ ] Cross-repo activity timeline
+- [ ] Markdown export for summaries
 
 ## Phase 2: AI Analysis
 

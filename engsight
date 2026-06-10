@@ -5,13 +5,33 @@ set -euo pipefail
 ENGSIGHT_DIR="${HOME}/.engsight"
 HOOKS_SOURCE="${ENGSIGHT_DIR}/templates/hooks"
 
+DB="${ENGSIGHT_DIR}/engsight.db"
+
 usage() {
   echo "Usage: engsight <command>"
   echo ""
   echo "Commands:"
-  echo "  init         Install engsight hooks in the current repo"
-  echo "  init-all     Install engsight hooks in all repos under a path"
-  echo "  status       Show engsight status for current repo"
+  echo "  init             Install engsight hooks in the current repo"
+  echo "  init-all PATH    Install engsight hooks in all repos under a path"
+  echo "  status           Show engsight status for current repo"
+  echo "  log              Show recent events across all repos"
+  echo "  repos            List repos with activity counts"
+  echo "  summary          Summarize activity for a time period"
+  echo ""
+  echo "Options for log:"
+  echo "  --repo NAME      Filter by repo name"
+  echo "  --type TYPE      Filter by event type (commit, checkout, push, etc.)"
+  echo "  --since DATE     Show events after DATE (YYYY-MM-DD)"
+  echo "  --limit N        Max events to show (default: 20)"
+  echo ""
+  echo "Options for repos:"
+  echo "  --since DATE     Show repos with activity after DATE"
+  echo ""
+  echo "Options for summary:"
+  echo "  --daily          Summarize today"
+  echo "  --weekly         Summarize last 7 days (default)"
+  echo "  --since DATE     Custom start date (YYYY-MM-DD)"
+  echo "  --until DATE     Custom end date (YYYY-MM-DD, default: today)"
   echo ""
 }
 
@@ -121,14 +141,363 @@ cmd_status() {
   fi
 }
 
+# --- Date helpers (BSD/GNU compat, matches engleader.tools) ---
+
+if date -v +0d >/dev/null 2>&1; then
+  # BSD date (macOS)
+  _engsight_date_ago() { date -v-"$1"d +"%Y-%m-%d"; }
+else
+  # GNU date
+  _engsight_date_ago() { date -d "$1 days ago" +"%Y-%m-%d"; }
+fi
+
+# --- Query helpers ---
+
+_engsight_check_db() {
+  if [[ ! -f "$DB" ]]; then
+    echo "Error: database not found at ${DB}" >&2
+    echo "Run install.sh first." >&2
+    exit 1
+  fi
+}
+
+_engsight_event_detail() {
+  # Extract a one-line detail from a payload based on event type
+  local event_type="$1" payload="$2"
+  case "$event_type" in
+    commit)
+      local msg
+      msg="$(echo "$payload" | sqlite3 :memory: "SELECT json_extract('${payload}', '$.message');" 2>/dev/null || echo "")"
+      # First line only, truncate
+      msg="${msg%%$'\n'*}"
+      if [[ ${#msg} -gt 60 ]]; then msg="${msg:0:57}..."; fi
+      printf '%s' "$msg"
+      ;;
+    checkout)
+      local prev new
+      prev="$(echo "$payload" | sqlite3 :memory: "SELECT json_extract('${payload}', '$.previous_branch');" 2>/dev/null || echo "?")"
+      new="$(echo "$payload" | sqlite3 :memory: "SELECT json_extract('${payload}', '$.new_branch');" 2>/dev/null || echo "?")"
+      printf '%s -> %s' "$prev" "$new"
+      ;;
+    push)
+      local count
+      count="$(echo "$payload" | sqlite3 :memory: "SELECT json_extract('${payload}', '$.commits_being_pushed');" 2>/dev/null || echo "?")"
+      printf '%s commit(s) pushed' "$count"
+      ;;
+    merge)
+      local merged
+      merged="$(echo "$payload" | sqlite3 :memory: "SELECT json_extract('${payload}', '$.merged_branch');" 2>/dev/null || echo "?")"
+      printf 'merged %s' "$merged"
+      ;;
+    rewrite)
+      local action
+      action="$(echo "$payload" | sqlite3 :memory: "SELECT json_extract('${payload}', '$.action');" 2>/dev/null || echo "?")"
+      printf '%s' "$action"
+      ;;
+    pre_commit)
+      printf 'staged files checked'
+      ;;
+    rebase)
+      local upstream
+      upstream="$(echo "$payload" | sqlite3 :memory: "SELECT json_extract('${payload}', '$.upstream');" 2>/dev/null || echo "?")"
+      printf 'onto %s' "$upstream"
+      ;;
+    *)
+      printf '%s' ""
+      ;;
+  esac
+}
+
+# --- log command ---
+
+cmd_log() {
+  _engsight_check_db
+
+  local repo="" event_type="" since="" limit=20
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --repo)     repo="$2"; shift 2 ;;
+      --type)     event_type="$2"; shift 2 ;;
+      --since)    since="$2"; shift 2 ;;
+      --limit)    limit="$2"; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      *)          echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  local where="1=1"
+  [[ -n "$repo" ]] && where="${where} AND repo_name='${repo}'"
+  [[ -n "$event_type" ]] && where="${where} AND event_type='${event_type}'"
+  [[ -n "$since" ]] && where="${where} AND timestamp >= '${since}T00:00:00Z'"
+
+  local query="SELECT timestamp, event_type, repo_name, branch, payload FROM events WHERE ${where} ORDER BY timestamp DESC LIMIT ${limit};"
+
+  local count
+  count="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where};")"
+
+  if [[ "$count" -eq 0 ]]; then
+    echo "No events found."
+    return
+  fi
+
+  printf "%-20s %-12s %-20s %-15s %s\n" "Timestamp" "Type" "Repo" "Branch" "Detail"
+  printf "%s\n" "────────────────────────────────────────────────────────────────────────────────────────────"
+
+  while IFS='|' read -r ts etype rname branch payload; do
+    local detail
+    detail="$(_engsight_event_detail "$etype" "$payload")"
+    # Format timestamp: strip seconds and Z for readability
+    local display_ts="${ts%:*}"
+    display_ts="${display_ts/T/ }"
+    printf "%-20s %-12s %-20s %-15s %s\n" "$display_ts" "$etype" "$rname" "$branch" "$detail"
+  done < <(sqlite3 "$DB" "$query")
+
+  if [[ "$count" -gt "$limit" ]]; then
+    echo ""
+    echo "Showing ${limit} of ${count} events. Use --limit to see more."
+  fi
+}
+
+# --- repos command ---
+
+cmd_repos() {
+  _engsight_check_db
+
+  local since=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --since)    since="$2"; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      *)          echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  local where="1=1"
+  [[ -n "$since" ]] && where="timestamp >= '${since}T00:00:00Z'"
+
+  local query="SELECT repo_name, COUNT(*) as event_count,
+    SUM(CASE WHEN event_type='commit' THEN 1 ELSE 0 END) as commits,
+    SUM(CASE WHEN event_type='checkout' THEN 1 ELSE 0 END) as checkouts,
+    MAX(timestamp) as last_active
+    FROM events WHERE ${where}
+    GROUP BY repo_name ORDER BY event_count DESC;"
+
+  local total_repos
+  total_repos="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT repo_name) FROM events WHERE ${where};")"
+
+  if [[ "$total_repos" -eq 0 ]]; then
+    echo "No repos with activity found."
+    return
+  fi
+
+  echo "Active repos: ${total_repos}"
+  echo ""
+  printf "%-25s %8s %8s %10s   %-20s\n" "Repo" "Events" "Commits" "Switches" "Last Active"
+  printf "%s\n" "────────────────────────────────────────────────────────────────────────────────────────"
+
+  while IFS='|' read -r rname event_count commits checkouts last_active; do
+    local display_ts="${last_active%:*}"
+    display_ts="${display_ts/T/ }"
+    printf "%-25s %8s %8s %10s   %-20s\n" "$rname" "$event_count" "$commits" "$checkouts" "$display_ts"
+  done < <(sqlite3 "$DB" "$query")
+}
+
+# --- summary command ---
+
+cmd_summary() {
+  _engsight_check_db
+
+  local since="" until_date="" mode="weekly"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --daily)    mode="daily"; shift ;;
+      --weekly)   mode="weekly"; shift ;;
+      --since)    since="$2"; mode="custom"; shift 2 ;;
+      --until)    until_date="$2"; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      *)          echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  # Resolve date range
+  case "$mode" in
+    daily)
+      since="$(_engsight_date_ago 0)"
+      until_date="$(_engsight_date_ago 0)"
+      ;;
+    weekly)
+      since="$(_engsight_date_ago 7)"
+      until_date="$(_engsight_date_ago 0)"
+      ;;
+    custom)
+      [[ -z "$since" ]] && { echo "Error: --since required for custom range" >&2; exit 1; }
+      [[ -z "$until_date" ]] && until_date="$(_engsight_date_ago 0)"
+      ;;
+  esac
+
+  local ts_start="${since}T00:00:00Z"
+  local ts_end="${until_date}T23:59:59Z"
+  local where="timestamp >= '${ts_start}' AND timestamp <= '${ts_end}'"
+
+  local total
+  total="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where};")"
+
+  if [[ "$total" -eq 0 ]]; then
+    echo "No activity from ${since} to ${until_date}."
+    return
+  fi
+
+  # Header
+  if [[ "$mode" == "daily" ]]; then
+    echo "Daily Summary: ${since}"
+  elif [[ "$mode" == "weekly" ]]; then
+    echo "Weekly Summary: ${since} to ${until_date}"
+  else
+    echo "Summary: ${since} to ${until_date}"
+  fi
+  printf "%s\n" "────────────────────────────────────────────"
+
+  # Overview
+  local repos commits checkouts pushes merges
+  repos="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT repo_name) FROM events WHERE ${where};")"
+  commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit';")"
+  checkouts="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='checkout';")"
+  pushes="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='push';")"
+  merges="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='merge';")"
+
+  echo ""
+  echo "Overview"
+  printf "  • Repos active:       %d\n" "$repos"
+  printf "  • Commits:            %d\n" "$commits"
+  printf "  • Branch switches:    %d\n" "$checkouts"
+  printf "  • Pushes:             %d\n" "$pushes"
+  printf "  • Merges:             %d\n" "$merges"
+  printf "  • Total events:       %d\n" "$total"
+
+  # Per-repo breakdown
+  echo ""
+  echo "Repos"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  while IFS='|' read -r rname rcommits revents; do
+    printf "  %-25s %d commits (%d events)\n" "$rname" "$rcommits" "$revents"
+  done < <(sqlite3 "$DB" "SELECT repo_name, SUM(CASE WHEN event_type='commit' THEN 1 ELSE 0 END), COUNT(*) FROM events WHERE ${where} GROUP BY repo_name ORDER BY 2 DESC;")
+
+  # AI co-authorship breakdown
+  echo ""
+  echo "AI Co-authorship"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  local ai_commits
+  ai_commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';")"
+
+  if [[ "$commits" -gt 0 ]]; then
+    local ai_pct
+    ai_pct="$(awk "BEGIN { printf \"%.0f\", (${ai_commits}/${commits})*100 }")"
+    printf "  • AI co-authored:     %d / %d commits (%s%%)\n" "$ai_commits" "$commits" "$ai_pct"
+  else
+    printf "  • AI co-authored:     0 commits\n"
+  fi
+
+  # Break down by co-author name
+  local coauthor_data
+  coauthor_data="$(sqlite3 "$DB" "
+    SELECT value FROM events, json_each(json_extract(payload, '$.ai_commit_signals.co_authored_by'))
+    WHERE ${where} AND event_type='commit'
+    AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';" 2>/dev/null || echo "")"
+
+  if [[ -n "$coauthor_data" ]]; then
+    echo ""
+    echo "  By tool:"
+    echo "$coauthor_data" | sort | uniq -c | sort -rn | while read -r count name; do
+      printf "    %-20s %d commits\n" "$name" "$count"
+    done
+  fi
+
+  # Pattern matches
+  local pattern_data
+  pattern_data="$(sqlite3 "$DB" "
+    SELECT value FROM events, json_each(json_extract(payload, '$.ai_commit_signals.pattern_matches'))
+    WHERE ${where} AND event_type='commit'
+    AND json_extract(payload, '$.ai_commit_signals.pattern_matches') != '[]';" 2>/dev/null || echo "")"
+
+  if [[ -n "$pattern_data" ]]; then
+    echo ""
+    echo "  Patterns detected:"
+    echo "$pattern_data" | sort | uniq -c | sort -rn | while read -r count pattern; do
+      printf "    %-30s %d matches\n" "$pattern" "$count"
+    done
+  fi
+
+  # AI artifacts presence
+  local repos_with_artifacts
+  repos_with_artifacts="$(sqlite3 "$DB" "
+    SELECT DISTINCT repo_name FROM events
+    WHERE ${where} AND event_type='pre_commit'
+    AND json_extract(payload, '$.ai_artifacts') != '{}';" 2>/dev/null || echo "")"
+
+  if [[ -n "$repos_with_artifacts" ]]; then
+    echo ""
+    echo "  Repos with AI artifacts:"
+    echo "$repos_with_artifacts" | while read -r rname; do
+      # Get the most recent artifact scan for this repo
+      local artifacts
+      artifacts="$(sqlite3 "$DB" "
+        SELECT json_extract(payload, '$.ai_artifacts') FROM events
+        WHERE ${where} AND event_type='pre_commit' AND repo_name='${rname}'
+        AND json_extract(payload, '$.ai_artifacts') != '{}'
+        ORDER BY timestamp DESC LIMIT 1;" 2>/dev/null || echo "{}")"
+      # List artifact keys
+      local keys
+      keys="$(sqlite3 :memory: "SELECT key FROM json_each('${artifacts}');" 2>/dev/null | paste -sd', ' -)"
+      printf "    %-25s %s\n" "$rname" "$keys"
+    done
+  fi
+
+  # Time patterns
+  if [[ "$commits" -gt 0 ]]; then
+    echo ""
+    echo "Time Patterns"
+    printf "%s\n" "────────────────────────────────────────────"
+
+    # Commits by hour bucket
+    local morning afternoon evening night
+    morning="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND CAST(json_extract(payload, '$.time_context.hour') AS INTEGER) BETWEEN 6 AND 11;")"
+    afternoon="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND CAST(json_extract(payload, '$.time_context.hour') AS INTEGER) BETWEEN 12 AND 17;")"
+    evening="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND CAST(json_extract(payload, '$.time_context.hour') AS INTEGER) BETWEEN 18 AND 22;")"
+    night="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND (CAST(json_extract(payload, '$.time_context.hour') AS INTEGER) >= 23 OR CAST(json_extract(payload, '$.time_context.hour') AS INTEGER) < 6);")"
+
+    printf "  • Morning (6–11):     %d commits\n" "$morning"
+    printf "  • Afternoon (12–17):  %d commits\n" "$afternoon"
+    printf "  • Evening (18–22):    %d commits\n" "$evening"
+    printf "  • Night (23–5):       %d commits\n" "$night"
+
+    # Weekend vs weekday
+    local weekend_commits
+    weekend_commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND json_extract(payload, '$.time_context.is_weekend') = 'true';" 2>/dev/null || echo 0)"
+    local weekday_commits=$(( commits - weekend_commits ))
+    printf "  • Weekday:            %d commits\n" "$weekday_commits"
+    printf "  • Weekend:            %d commits\n" "$weekend_commits"
+  fi
+}
+
 # --- Main ---
-case "${1:-}" in
+COMMAND="${1:-}"
+[[ -n "$COMMAND" ]] && shift
+
+case "$COMMAND" in
   init)       cmd_init ;;
-  init-all)   cmd_init_all "${2:-}" ;;
+  init-all)   cmd_init_all "${1:-}" ;;
   status)     cmd_status ;;
+  log)        cmd_log "$@" ;;
+  repos)      cmd_repos "$@" ;;
+  summary)    cmd_summary "$@" ;;
   -h|--help|"") usage ;;
   *)
-    echo "Unknown command: $1" >&2
+    echo "Unknown command: $COMMAND" >&2
     usage
     exit 1
     ;;

@@ -86,7 +86,38 @@ For existing repos:
 engsight init          # Install hooks in the current repo
 engsight init-all PATH # Install hooks in all git repos under PATH
 engsight status        # Show hook status and event count for current repo
+engsight log           # Show recent events across all repos
+engsight repos         # List repos with activity counts
+engsight summary       # Summarize activity for a time period
 ```
+
+### log
+
+```bash
+engsight log                          # Last 20 events across all repos
+engsight log --repo myproject         # Filter by repo
+engsight log --type commit            # Filter by event type
+engsight log --since 2025-01-15       # Events after a date
+engsight log --limit 50               # Show more events
+```
+
+### repos
+
+```bash
+engsight repos                        # All repos, sorted by event count
+engsight repos --since 2025-01-01     # Repos active since a date
+```
+
+### summary
+
+```bash
+engsight summary --daily              # Today's activity
+engsight summary --weekly             # Last 7 days (default)
+engsight summary --since 2025-01-01   # Custom start date
+engsight summary --since 2025-01-01 --until 2025-01-31  # Custom range
+```
+
+The summary includes: repos touched, commit/push/merge/checkout counts, AI co-authorship breakdown by tool and pattern, AI artifact presence, and time-of-day/weekday patterns.
 
 ## Configuration
 
