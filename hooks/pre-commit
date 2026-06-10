@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# engsight pre-commit hook — AI artifact shadow indexing
+set -uo pipefail
+
+source "${HOME}/.engsight/common.sh" 2>/dev/null || exit 0
+engsight_load_config
+engsight_check_excluded || exit 0
+
+# Staged files
+staged_json="["
+first=true
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  if [[ "$first" != "true" ]]; then staged_json+=","; fi
+  staged_json+="\"$(engsight_json_escape "$f")\""
+  first=false
+done <<< "$(git diff --cached --name-only 2>/dev/null)"
+staged_json+="]"
+
+# AI artifacts
+ai_artifacts="$(engsight_scan_ai_artifacts)"
+
+payload="{\"staged_files\":${staged_json},\"ai_artifacts\":${ai_artifacts}}"
+
+engsight_log "pre_commit" "$payload"
+
+# Chain to local hook
+engsight_chain_local "pre-commit" "$@"

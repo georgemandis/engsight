@@ -1,0 +1,58 @@
+#!/usr/bin/env bash
+# engsight post-merge hook
+set -uo pipefail
+
+source "${HOME}/.engsight/common.sh" 2>/dev/null || exit 0
+engsight_load_config
+engsight_check_excluded || exit 0
+
+is_squash_merge="$1"  # 1 if squash merge
+
+# Determine if fast-forward
+is_fast_forward=true
+if [[ "$(git cat-file -p HEAD 2>/dev/null | grep -c '^parent ')" -gt 1 ]]; then
+  is_fast_forward=false
+fi
+
+# Try to get merged branch from MERGE_MSG or reflog
+merged_branch=""
+if [[ -f "$(git rev-parse --git-dir)/MERGE_MSG" ]]; then
+  merged_branch="$(head -1 "$(git rev-parse --git-dir)/MERGE_MSG" 2>/dev/null | grep -oE "branch '[^']+'" | tr -d "'" | sed 's/branch //' || echo "")"
+fi
+
+# Diff stats from merge
+diffstat="$(git diff-tree --no-commit-id --shortstat HEAD 2>/dev/null)"
+files_changed="$(echo "$diffstat" | grep -oE '[0-9]+ file' | grep -oE '[0-9]+' || echo 0)"
+insertions="$(echo "$diffstat" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo 0)"
+deletions="$(echo "$diffstat" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo 0)"
+
+# Count merged commits (approximate: parents of merge commit)
+commits_merged=0
+if [[ "$is_fast_forward" == "false" ]]; then
+  merge_base="$(git merge-base HEAD HEAD~1 2>/dev/null || echo "")"
+  if [[ -n "$merge_base" ]]; then
+    commits_merged="$(git rev-list "${merge_base}..HEAD^2" 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+fi
+
+terminal="$(engsight_terminal_context)"
+time_ctx="$(engsight_time_context)"
+
+payload="$(cat <<EOF
+{
+  "is_fast_forward": ${is_fast_forward},
+  "is_squash_merge": $([ "$is_squash_merge" = "1" ] && echo true || echo false),
+  "merged_branch": "$(engsight_json_escape "$merged_branch")",
+  "commits_merged": ${commits_merged},
+  "files_changed": ${files_changed},
+  "insertions": ${insertions},
+  "deletions": ${deletions},
+  "terminal": "${terminal}",
+  "time_context": ${time_ctx}
+}
+EOF
+)"
+
+engsight_log "merge" "$payload"
+
+engsight_chain_local "post-merge" "$@"

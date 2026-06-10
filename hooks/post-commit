@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# engsight post-commit hook
+set -uo pipefail
+
+source "${HOME}/.engsight/common.sh" 2>/dev/null || exit 0
+engsight_load_config
+engsight_check_excluded || exit 0
+
+# --- Gather commit data ---
+sha="$(git rev-parse HEAD 2>/dev/null)"
+message="$(git log -1 --format=%B 2>/dev/null)"
+message_escaped="$(engsight_json_escape "$message")"
+message_length="${#message}"
+
+# Diff stats
+diffstat="$(git diff-tree --no-commit-id --shortstat HEAD 2>/dev/null)"
+files_changed="$(echo "$diffstat" | grep -oE '[0-9]+ file' | grep -oE '[0-9]+' || echo 0)"
+insertions="$(echo "$diffstat" | grep -oE '[0-9]+ insertion' | grep -oE '[0-9]+' || echo 0)"
+deletions="$(echo "$diffstat" | grep -oE '[0-9]+ deletion' | grep -oE '[0-9]+' || echo 0)"
+
+# File list
+files_json="["
+first=true
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  if [[ "$first" != "true" ]]; then files_json+=","; fi
+  files_json+="\"$(engsight_json_escape "$f")\""
+  first=false
+done <<< "$(git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null)"
+files_json+="]"
+
+# File type breakdown
+declare -A type_counts
+while IFS= read -r f; do
+  [[ -z "$f" ]] && continue
+  ext="${f##*.}"
+  if [[ "$ext" == "$f" ]]; then ext="(none)"; else ext=".${ext}"; fi
+  type_counts["$ext"]=$(( ${type_counts["$ext"]:-0} + 1 ))
+done <<< "$(git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null)"
+file_types_json="{"
+first=true
+for ext in "${!type_counts[@]}"; do
+  if [[ "$first" != "true" ]]; then file_types_json+=","; fi
+  file_types_json+="\"$(engsight_json_escape "$ext")\":${type_counts[$ext]}"
+  first=false
+done
+file_types_json+="}"
+
+# Diff size
+diff_size_bytes="$(git diff-tree -p HEAD 2>/dev/null | wc -c | tr -d ' ')"
+
+# Merge / amend detection
+is_merge=false
+if [[ "$(git cat-file -p HEAD 2>/dev/null | grep -c '^parent ')" -gt 1 ]]; then
+  is_merge=true
+fi
+is_amend=false
+# Amend is hard to detect in post-commit; post-rewrite handles this better
+
+# Time since last commit
+time_repo="$(engsight_time_since_last "commit" "repo")"
+time_global="$(engsight_time_since_last "commit" "global")"
+
+# AI signals
+ai_signals="$(engsight_scan_ai_commit_signals "$message")"
+ai_artifacts="$(engsight_scan_ai_artifacts)"
+
+# Context
+terminal="$(engsight_terminal_context)"
+workdir="$(engsight_workdir_state)"
+time_ctx="$(engsight_time_context)"
+process_ctx="$(engsight_process_snapshot)"
+
+# --- Build payload ---
+payload="$(cat <<EOF
+{
+  "sha": "${sha}",
+  "message": "${message_escaped}",
+  "message_length": ${message_length},
+  "files_changed": ${files_changed},
+  "insertions": ${insertions},
+  "deletions": ${deletions},
+  "files": ${files_json},
+  "file_types": ${file_types_json},
+  "is_merge": ${is_merge},
+  "is_amend": ${is_amend},
+  "diff_size_bytes": ${diff_size_bytes},
+  "time_since_last_commit_repo_seconds": ${time_repo},
+  "time_since_last_commit_global_seconds": ${time_global},
+  "ai_commit_signals": ${ai_signals},
+  "ai_artifacts": ${ai_artifacts},
+  "terminal": "${terminal}",
+  "workdir_state": ${workdir},
+  "time_context": ${time_ctx},
+  "process_context": ${process_ctx}
+}
+EOF
+)"
+
+engsight_log "commit" "$payload"
+
+# Chain to local hook
+engsight_chain_local "post-commit" "$@"

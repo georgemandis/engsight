@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# engsight post-rewrite hook — tracks amend/rebase rewrites
+set -uo pipefail
+
+source "${HOME}/.engsight/common.sh" 2>/dev/null || exit 0
+engsight_load_config
+engsight_check_excluded || exit 0
+
+cause="$1"  # "amend" or "rebase"
+
+# Read stdin: old-sha new-sha pairs
+rewritten_json="["
+count=0
+first=true
+while IFS=' ' read -r old_sha new_sha _extra; do
+  [[ -z "$old_sha" ]] && continue
+  if [[ "$first" != "true" ]]; then rewritten_json+=","; fi
+  rewritten_json+="{\"old_sha\":\"${old_sha}\",\"new_sha\":\"${new_sha}\"}"
+  first=false
+  count=$(( count + 1 ))
+done
+rewritten_json+="]"
+
+payload="$(cat <<EOF
+{
+  "cause": "$(engsight_json_escape "$cause")",
+  "rewritten_commits": ${rewritten_json},
+  "count": ${count}
+}
+EOF
+)"
+
+engsight_log "rewrite" "$payload"
+
+# Chain — don't exec since we consumed stdin
+local_hook="$(git rev-parse --git-dir 2>/dev/null)/hooks/post-rewrite.local"
+if [[ -x "$local_hook" ]]; then
+  "$local_hook" "$@"
+fi

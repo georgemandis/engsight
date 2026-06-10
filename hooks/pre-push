@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# engsight pre-push hook — session boundary tracking
+set -uo pipefail
+
+source "${HOME}/.engsight/common.sh" 2>/dev/null || exit 0
+engsight_load_config
+engsight_check_excluded || exit 0
+
+remote="$1"
+remote_url="$2"
+
+# Read stdin for refs being pushed
+branches_json="["
+commits_total=0
+first=true
+while IFS=' ' read -r local_ref local_sha remote_ref remote_sha; do
+  branch_name="${local_ref#refs/heads/}"
+  if [[ "$first" != "true" ]]; then branches_json+=","; fi
+  branches_json+="\"$(engsight_json_escape "$branch_name")\""
+  first=false
+
+  # Count commits being pushed
+  if [[ "$remote_sha" == "0000000000000000000000000000000000000000" ]]; then
+    # New branch, count all commits
+    count="$(git rev-list "$local_sha" 2>/dev/null | wc -l | tr -d ' ')"
+  else
+    count="$(git rev-list "${remote_sha}..${local_sha}" 2>/dev/null | wc -l | tr -d ' ')"
+  fi
+  commits_total=$(( commits_total + count ))
+done
+branches_json+="]"
+
+time_since_push="$(engsight_time_since_last "push" "repo")"
+terminal="$(engsight_terminal_context)"
+time_ctx="$(engsight_time_context)"
+
+payload="$(cat <<EOF
+{
+  "remote": "$(engsight_json_escape "$remote")",
+  "remote_url": "$(engsight_json_escape "$remote_url")",
+  "commits_being_pushed": ${commits_total},
+  "branches": ${branches_json},
+  "time_since_last_push_seconds": ${time_since_push},
+  "terminal": "${terminal}",
+  "time_context": ${time_ctx}
+}
+EOF
+)"
+
+engsight_log "push" "$payload"
+
+# Chain to local hook — NOTE: do NOT exec, pre-push must not swallow stdin for local hook
+local_hook="$(git rev-parse --git-dir 2>/dev/null)/hooks/pre-push.local"
+if [[ -x "$local_hook" ]]; then
+  "$local_hook" "$@"
+fi

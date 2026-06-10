@@ -1,0 +1,135 @@
+#!/usr/bin/env bash
+# engsight — personal engineering insight tool
+set -euo pipefail
+
+ENGSIGHT_DIR="${HOME}/.engsight"
+HOOKS_SOURCE="${ENGSIGHT_DIR}/templates/hooks"
+
+usage() {
+  echo "Usage: engsight <command>"
+  echo ""
+  echo "Commands:"
+  echo "  init         Install engsight hooks in the current repo"
+  echo "  init-all     Install engsight hooks in all repos under a path"
+  echo "  status       Show engsight status for current repo"
+  echo ""
+}
+
+cmd_init() {
+  local git_dir
+  git_dir="$(git rev-parse --git-dir 2>/dev/null)" || {
+    echo "Error: not a git repository" >&2
+    exit 1
+  }
+
+  local hooks_dir="${git_dir}/hooks"
+  mkdir -p "$hooks_dir"
+
+  echo "Installing engsight hooks in $(git rev-parse --show-toplevel)..."
+
+  for hook_src in "${HOOKS_SOURCE}"/*; do
+    local hook_name
+    hook_name="$(basename "$hook_src")"
+    local hook_dest="${hooks_dir}/${hook_name}"
+
+    # If a local hook already exists and isn't an engsight hook, rename it
+    if [[ -f "$hook_dest" ]]; then
+      if ! grep -q "engsight" "$hook_dest" 2>/dev/null; then
+        mv "$hook_dest" "${hook_dest}.local"
+        echo "  Renamed existing ${hook_name} -> ${hook_name}.local"
+      else
+        echo "  ${hook_name} already installed (skipped)"
+        continue
+      fi
+    fi
+
+    cp "$hook_src" "$hook_dest"
+    chmod +x "$hook_dest"
+    echo "  Installed ${hook_name}"
+  done
+
+  echo "Done!"
+}
+
+cmd_init_all() {
+  local search_path="${1:-$(pwd)}"
+
+  if [[ ! -d "$search_path" ]]; then
+    echo "Error: '$search_path' is not a directory" >&2
+    exit 1
+  fi
+
+  echo "Finding git repos under ${search_path}..."
+  local count=0
+  local failed=0
+
+  while IFS= read -r git_dir; do
+    local repo_dir
+    repo_dir="$(dirname "$git_dir")"
+    echo ""
+    echo "--- $(basename "$repo_dir") ---"
+    if (cd "$repo_dir" && cmd_init); then
+      count=$(( count + 1 ))
+    else
+      echo "  FAILED"
+      failed=$(( failed + 1 ))
+    fi
+  done < <(find "$search_path" -name .git -type d -not -path '*/node_modules/*' -not -path '*/.git/modules/*' 2>/dev/null)
+
+  echo ""
+  echo "Initialized ${count} repos. ${failed} failed."
+}
+
+cmd_status() {
+  local repo_path
+  repo_path="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+    echo "Error: not a git repository" >&2
+    exit 1
+  }
+
+  local repo_name
+  repo_name="$(basename "$repo_path")"
+
+  echo "engsight status for ${repo_name}"
+  echo "  Repo: ${repo_path}"
+
+  # Check installed hooks
+  local git_dir
+  git_dir="$(git rev-parse --git-dir 2>/dev/null)"
+  local hooks_dir="${git_dir}/hooks"
+  local installed=0
+
+  for hook_name in post-commit pre-commit post-checkout post-merge pre-push pre-rebase post-rewrite; do
+    if [[ -f "${hooks_dir}/${hook_name}" ]] && grep -q "engsight" "${hooks_dir}/${hook_name}" 2>/dev/null; then
+      installed=$(( installed + 1 ))
+    fi
+  done
+  echo "  Hooks installed: ${installed}/7"
+
+  # Event count
+  if [[ -f "${ENGSIGHT_DIR}/engsight.db" ]]; then
+    source "${ENGSIGHT_DIR}/common.sh" 2>/dev/null
+    engsight_load_config
+    local total
+    total="$(sqlite3 "$ENGSIGHT_DB" "SELECT COUNT(*) FROM events WHERE repo_path='${repo_path}';" 2>/dev/null || echo 0)"
+    local latest
+    latest="$(sqlite3 "$ENGSIGHT_DB" "SELECT timestamp FROM events WHERE repo_path='${repo_path}' ORDER BY timestamp DESC LIMIT 1;" 2>/dev/null || echo "none")"
+    echo "  Events recorded: ${total}"
+    echo "  Latest event: ${latest}"
+  else
+    echo "  Database: not found"
+  fi
+}
+
+# --- Main ---
+case "${1:-}" in
+  init)       cmd_init ;;
+  init-all)   cmd_init_all "${2:-}" ;;
+  status)     cmd_status ;;
+  -h|--help|"") usage ;;
+  *)
+    echo "Unknown command: $1" >&2
+    usage
+    exit 1
+    ;;
+esac

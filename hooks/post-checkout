@@ -1,0 +1,55 @@
+#!/usr/bin/env bash
+# engsight post-checkout hook — context switching detection
+set -uo pipefail
+
+source "${HOME}/.engsight/common.sh" 2>/dev/null || exit 0
+engsight_load_config
+engsight_check_excluded || exit 0
+
+previous_ref="$1"
+new_ref="$2"
+is_branch_switch="$3"  # 1 = branch switch, 0 = file checkout
+
+# Skip file checkouts unless we decide they're interesting
+if [[ "$is_branch_switch" == "0" ]]; then
+  is_file_checkout=true
+  is_branch_flag=false
+else
+  is_file_checkout=false
+  is_branch_flag=true
+fi
+
+# Resolve branch names
+previous_branch="$(git name-rev --name-only "$previous_ref" 2>/dev/null | sed 's|remotes/origin/||')"
+new_branch="$(engsight_current_branch)"
+
+# Detect new branch
+is_new_branch=false
+if [[ "$is_branch_flag" == "true" ]]; then
+  reflog_count="$(git reflog show "$new_branch" 2>/dev/null | wc -l | tr -d ' ')"
+  if [[ "$reflog_count" -le 1 ]]; then
+    is_new_branch=true
+  fi
+fi
+
+terminal="$(engsight_terminal_context)"
+time_ctx="$(engsight_time_context)"
+
+payload="$(cat <<EOF
+{
+  "previous_ref": "${previous_ref}",
+  "new_ref": "${new_ref}",
+  "previous_branch": "$(engsight_json_escape "$previous_branch")",
+  "new_branch": "$(engsight_json_escape "$new_branch")",
+  "is_branch_switch": ${is_branch_flag},
+  "is_file_checkout": ${is_file_checkout},
+  "is_new_branch": ${is_new_branch},
+  "terminal": "${terminal}",
+  "time_context": ${time_ctx}
+}
+EOF
+)"
+
+engsight_log "checkout" "$payload"
+
+engsight_chain_local "post-checkout" "$@"

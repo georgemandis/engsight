@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# engsight pre-rebase hook — capture pre-squash state
+set -uo pipefail
+
+source "${HOME}/.engsight/common.sh" 2>/dev/null || exit 0
+engsight_load_config
+engsight_check_excluded || exit 0
+
+upstream="${1:-}"
+branch="${2:-$(engsight_current_branch)}"
+
+# Count and list commits that will be rebased
+commit_shas_json="["
+commits_to_rebase=0
+first=true
+if [[ -n "$upstream" ]]; then
+  while IFS= read -r sha; do
+    [[ -z "$sha" ]] && continue
+    if [[ "$first" != "true" ]]; then commit_shas_json+=","; fi
+    commit_shas_json+="\"${sha}\""
+    first=false
+    commits_to_rebase=$(( commits_to_rebase + 1 ))
+  done <<< "$(git rev-list "${upstream}..${branch}" 2>/dev/null)"
+fi
+commit_shas_json+="]"
+
+terminal="$(engsight_terminal_context)"
+
+payload="$(cat <<EOF
+{
+  "upstream": "$(engsight_json_escape "$upstream")",
+  "branch": "$(engsight_json_escape "$branch")",
+  "commits_to_rebase": ${commits_to_rebase},
+  "commit_shas": ${commit_shas_json},
+  "terminal": "${terminal}"
+}
+EOF
+)"
+
+engsight_log "pre_rebase" "$payload"
+
+# Chain to local hook
+engsight_chain_local "pre-rebase" "$@"
