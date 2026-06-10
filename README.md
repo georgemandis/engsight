@@ -190,3 +190,4 @@ sqlite3 ~/.engsight/engsight.db \
 See [ROADMAP.md](ROADMAP.md) for what's next: query CLI, MCP server, AI-powered summaries, GitHub enrichment, and more.
 
 See [docs/DESIGN.md](docs/DESIGN.md) for the full design spec including all payload schemas.
+# process sniffing test
