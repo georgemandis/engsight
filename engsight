@@ -20,6 +20,7 @@ usage() {
   echo "  sessions         Reconstruct work sessions from event clusters"
   echo "  patterns         Surface working patterns and insights"
   echo "  diff             Compare activity between two time periods"
+  echo "  narrate          Generate an LLM narrative of your activity (requires llm)"
   echo ""
   echo "Options for log:"
   echo "  --repo NAME      Filter by repo name"
@@ -53,6 +54,14 @@ usage() {
   echo "  --weekly         Compare this week vs last week (default)"
   echo "  --monthly        Compare this month vs last month"
   echo "  --period A B     Compare two custom periods: A=YYYY-MM-DD..YYYY-MM-DD"
+  echo ""
+  echo "Options for narrate:"
+  echo "  --daily          Narrate today"
+  echo "  --weekly         Narrate last 7 days (default)"
+  echo "  --since DATE     Custom start date (YYYY-MM-DD)"
+  echo "  --until DATE     Custom end date (YYYY-MM-DD, default: today)"
+  echo "  --md             Output raw markdown instead of piping to llm"
+  echo "  --prompt TEXT    Override the default system prompt"
   echo ""
 }
 
@@ -1639,6 +1648,282 @@ cmd_diff() {
   fi
 }
 
+# --- narrate command ---
+
+_engsight_default_prompt() {
+  cat <<'PROMPT'
+You are summarizing an individual contributor's engineering activity for their own self-reflection. The data comes from local git hooks — no GitHub/platform data, purely local machine activity.
+
+Write a concise, honest narrative summary. Focus on:
+- What they worked on and where they spent their time
+- Patterns worth noticing (focus vs. scatter, momentum, work style)
+- AI tool usage patterns if present
+- Anything that looks like it might warrant attention (high churn files, stale repos, unusual hours)
+
+Tone: direct, observational, like a thoughtful colleague reviewing your week. Not promotional, not judgmental. Skip sections with no interesting signal. Use short paragraphs, not bullet lists.
+
+Do not hallucinate details that aren't in the data. If the data is thin, say so briefly and focus on what's there.
+PROMPT
+}
+
+cmd_narrate() {
+  _engsight_check_db
+
+  local since="" until_date="" mode="weekly" md_only=false custom_prompt=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --daily)    mode="daily"; shift ;;
+      --weekly)   mode="weekly"; shift ;;
+      --since)    since="$2"; mode="custom"; shift 2 ;;
+      --until)    until_date="$2"; shift 2 ;;
+      --md)       md_only=true; shift ;;
+      --prompt)   custom_prompt="$2"; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      *)          echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  case "$mode" in
+    daily)   since="$(_engsight_date_ago 0)"; until_date="$(_engsight_date_ago 0)" ;;
+    weekly)  since="$(_engsight_date_ago 7)"; until_date="$(_engsight_date_ago 0)" ;;
+    custom)
+      [[ -z "$since" ]] && { echo "Error: --since required" >&2; exit 1; }
+      [[ -z "$until_date" ]] && until_date="$(_engsight_date_ago 0)"
+      ;;
+  esac
+
+  local ts_start="${since}T00:00:00Z"
+  local ts_end="${until_date}T23:59:59Z"
+  local where="timestamp >= '${ts_start}' AND timestamp <= '${ts_end}'"
+
+  local total
+  total="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where};")"
+
+  if [[ "$total" -eq 0 ]]; then
+    echo "No activity from ${since} to ${until_date}."
+    return
+  fi
+
+  # --- Build markdown document ---
+  local md=""
+  md+="# Engineering Activity: ${since} to ${until_date}"$'\n'
+  md+=""$'\n'
+
+  # Overview stats
+  local commits checkouts pushes merges repos
+  commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit';")"
+  checkouts="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='checkout';")"
+  pushes="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='push';")"
+  merges="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='merge';")"
+  repos="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT repo_name) FROM events WHERE ${where};")"
+
+  md+="## Overview"$'\n'
+  md+="- ${commits} commits across ${repos} repos"$'\n'
+  md+="- ${checkouts} branch switches, ${pushes} pushes, ${merges} merges"$'\n'
+  md+="- ${total} total events"$'\n'
+  md+=""$'\n'
+
+  # Per-repo breakdown
+  md+="## Repos"$'\n'
+  while IFS='|' read -r rname rcommits revents; do
+    md+="- **${rname}**: ${rcommits} commits (${revents} events)"$'\n'
+  done < <(sqlite3 "$DB" "SELECT repo_name, SUM(CASE WHEN event_type='commit' THEN 1 ELSE 0 END), COUNT(*) FROM events WHERE ${where} GROUP BY repo_name ORDER BY 2 DESC;")
+  md+=""$'\n'
+
+  # Recent commit messages (first line only via SUBSTR to newline)
+  md+="## Recent Commits"$'\n'
+  while IFS='|' read -r ts rname msg; do
+    [[ -z "$ts" ]] && continue
+    local display_ts="${ts/T/ }"
+    display_ts="${display_ts%Z}"
+    md+="- [${rname}] ${msg} (${display_ts})"$'\n'
+  done < <(sqlite3 "$DB" "
+    SELECT timestamp, repo_name,
+      CASE WHEN INSTR(json_extract(payload, '$.message'), CHAR(10)) > 0
+        THEN SUBSTR(json_extract(payload, '$.message'), 1, INSTR(json_extract(payload, '$.message'), CHAR(10)) - 1)
+        ELSE json_extract(payload, '$.message')
+      END as first_line
+    FROM events WHERE ${where} AND event_type='commit'
+    ORDER BY timestamp DESC LIMIT 20;")
+  md+=""$'\n'
+
+  # AI co-authorship
+  local ai_commits
+  ai_commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';")"
+  md+="## AI Usage"$'\n'
+  if [[ "$commits" -gt 0 ]]; then
+    local ai_pct
+    ai_pct="$(awk "BEGIN { printf \"%.0f\", (${ai_commits}/${commits})*100 }")"
+    md+="- ${ai_commits} / ${commits} commits (${ai_pct}%) had AI co-authors"$'\n'
+  fi
+
+  # Co-author breakdown
+  local coauthor_data
+  coauthor_data="$(sqlite3 "$DB" "
+    SELECT value, COUNT(*) FROM events, json_each(json_extract(payload, '$.ai_commit_signals.co_authored_by'))
+    WHERE ${where} AND event_type='commit'
+    AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
+    GROUP BY value ORDER BY 2 DESC;" 2>/dev/null)"
+  if [[ -n "$coauthor_data" ]]; then
+    md+="- By tool:"$'\n'
+    echo "$coauthor_data" | while IFS='|' read -r name count; do
+      md+="  - ${name}: ${count} commits"$'\n'
+      echo "  - ${name}: ${count} commits"
+    done | while read -r line; do true; done
+    # Re-read for proper append
+    while IFS='|' read -r name count; do
+      md+="  - ${name}: ${count} commits"$'\n'
+    done <<< "$coauthor_data"
+  fi
+
+  # Process context
+  if [[ -f "${ENGSIGHT_DIR}/config" ]]; then
+    source "${ENGSIGHT_DIR}/config" 2>/dev/null
+  fi
+  if [[ "${ENGSIGHT_PROCESS_SNIFF:-false}" == "true" || "${ENGSIGHT_PROCESS_SNIFF:-false}" == "deep" ]]; then
+    local tool_presence
+    tool_presence="$(sqlite3 "$DB" "
+      SELECT json_extract(value, '$.name'),
+        COUNT(*),
+        AVG(CAST(json_extract(value, '$.instances') AS REAL)),
+        AVG(CAST(json_extract(value, '$.total_memory_mb') AS INTEGER))
+      FROM events, json_each(json_extract(payload, '$.process_context.active_ai_tools'))
+      WHERE ${where} AND event_type='commit'
+      GROUP BY 1 ORDER BY 2 DESC;" 2>/dev/null)"
+    if [[ -n "$tool_presence" ]]; then
+      md+="- Tools running at commit time:"$'\n'
+      while IFS='|' read -r tname tcount tinst tmem; do
+        local inst_display
+        inst_display="$(awk "BEGIN { printf \"%.1f\", ${tinst:-0} }")"
+        md+="  - ${tname}: present during ${tcount} commits (avg ${inst_display} instances, ~${tmem:-0}MB)"$'\n'
+      done <<< "$tool_presence"
+    fi
+  fi
+  md+=""$'\n'
+
+  # Commit granularity
+  md+="## Commit Granularity"$'\n'
+  if [[ "$commits" -gt 0 ]]; then
+    local avg_files avg_lines
+    avg_files="$(sqlite3 "$DB" "SELECT AVG(json_extract(payload, '$.files_changed')) FROM events WHERE ${where} AND event_type='commit';" 2>/dev/null)"
+    avg_lines="$(sqlite3 "$DB" "SELECT AVG(COALESCE(json_extract(payload, '$.insertions'),0) + COALESCE(json_extract(payload, '$.deletions'),0)) FROM events WHERE ${where} AND event_type='commit';" 2>/dev/null)"
+    avg_files="$(awk "BEGIN { printf \"%.1f\", ${avg_files:-0} }")"
+    avg_lines="$(awk "BEGIN { printf \"%.0f\", ${avg_lines:-0} }")"
+    md+="- Average ${avg_files} files and ${avg_lines} lines per commit"$'\n'
+  fi
+
+  # Rewrite rate
+  local rewrites
+  rewrites="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='rewrite';")"
+  if [[ "$rewrites" -gt 0 ]]; then
+    md+="- ${rewrites} rewrites (amends/rebases)"$'\n'
+  fi
+  md+=""$'\n'
+
+  # File hotspots
+  local hotspots
+  hotspots="$(sqlite3 "$DB" "
+    SELECT value, COUNT(*) as touches
+    FROM events, json_each(json_extract(payload, '$.files'))
+    WHERE ${where} AND event_type='commit'
+    GROUP BY value HAVING touches > 1
+    ORDER BY touches DESC LIMIT 10;" 2>/dev/null)"
+  if [[ -n "$hotspots" ]]; then
+    md+="## File Hotspots"$'\n'
+    md+="Files touched in multiple commits:"$'\n'
+    while IFS='|' read -r fpath touches; do
+      md+="- ${fpath}: ${touches} commits"$'\n'
+    done <<< "$hotspots"
+    md+=""$'\n'
+  fi
+
+  # Time patterns
+  if [[ "$commits" -gt 0 ]]; then
+    md+="## Time Patterns"$'\n'
+    local morning afternoon evening night
+    morning="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND CAST(json_extract(payload, '$.time_context.hour') AS INTEGER) BETWEEN 6 AND 11;")"
+    afternoon="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND CAST(json_extract(payload, '$.time_context.hour') AS INTEGER) BETWEEN 12 AND 17;")"
+    evening="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND CAST(json_extract(payload, '$.time_context.hour') AS INTEGER) BETWEEN 18 AND 22;")"
+    night="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND (CAST(json_extract(payload, '$.time_context.hour') AS INTEGER) >= 23 OR CAST(json_extract(payload, '$.time_context.hour') AS INTEGER) < 6);")"
+    md+="- Morning (6–11): ${morning}, Afternoon (12–17): ${afternoon}, Evening (18–22): ${evening}, Night (23–5): ${night}"$'\n'
+
+    local weekend_commits
+    weekend_commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND json_extract(payload, '$.time_context.is_weekend') = 'true';" 2>/dev/null || echo 0)"
+    local weekday_commits=$(( commits - weekend_commits ))
+    md+="- Weekday: ${weekday_commits}, Weekend: ${weekend_commits}"$'\n'
+    md+=""$'\n'
+  fi
+
+  # Push latency
+  local push_lat
+  push_lat="$(sqlite3 "$DB" "
+    SELECT AVG(latency) FROM (
+      SELECT CAST((julianday(p.timestamp) - julianday(
+        (SELECT MAX(c.timestamp) FROM events c
+         WHERE c.repo_name = p.repo_name AND c.event_type='commit'
+         AND c.timestamp < p.timestamp)
+      )) * 86400 AS INTEGER) as latency
+      FROM events p
+      WHERE p.event_type='push' AND p.timestamp >= '${ts_start}' AND p.timestamp <= '${ts_end}'
+    ) WHERE latency IS NOT NULL AND latency > 0;" 2>/dev/null)"
+  if [[ -n "$push_lat" && "$push_lat" != "" ]]; then
+    local lat_display
+    lat_display="$(_engsight_format_duration "$(awk "BEGIN { printf \"%.0f\", ${push_lat} }")")"
+    md+="## Commit-to-Push"$'\n'
+    md+="- Average latency: ${lat_display}"$'\n'
+    md+=""$'\n'
+  fi
+
+  # Ownership concentration
+  if [[ "$commits" -gt 0 ]]; then
+    md+="## Focus"$'\n'
+    local top_repo top_commits focus_pct
+    top_repo="$(sqlite3 "$DB" "SELECT repo_name FROM events WHERE ${where} AND event_type='commit' GROUP BY repo_name ORDER BY COUNT(*) DESC LIMIT 1;")"
+    top_commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND repo_name='${top_repo}';")"
+    focus_pct="$(awk "BEGIN { printf \"%.0f\", (${top_commits}/${commits})*100 }")"
+    md+="- ${focus_pct}% of commits in ${top_repo}"$'\n'
+
+    local unique_branches
+    unique_branches="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT repo_name || '/' || branch) FROM events WHERE ${where};")"
+    md+="- ${repos} repos, ${unique_branches} branches active"$'\n'
+
+    # File types
+    local file_type_list
+    file_type_list="$(sqlite3 "$DB" "
+      SELECT DISTINCT key FROM events, json_each(json_extract(payload, '$.file_types'))
+      WHERE ${where} AND event_type='commit' AND key != '(none)';" 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')"
+    if [[ -n "$file_type_list" ]]; then
+      md+="- File types: ${file_type_list}"$'\n'
+    fi
+    md+=""$'\n'
+  fi
+
+  # --- Output ---
+  if [[ "$md_only" == "true" ]]; then
+    echo "$md"
+    return
+  fi
+
+  # Check for llm
+  if ! command -v llm >/dev/null 2>&1; then
+    echo "Error: 'llm' is not installed. Install it with: brew install llm (or pip install llm)" >&2
+    echo "See: https://github.com/simonw/llm" >&2
+    echo "" >&2
+    echo "Alternatively, use --md to output raw markdown." >&2
+    exit 2
+  fi
+
+  local system_prompt
+  if [[ -n "$custom_prompt" ]]; then
+    system_prompt="$custom_prompt"
+  else
+    system_prompt="$(_engsight_default_prompt)"
+  fi
+
+  echo "$md" | llm --system "$system_prompt"
+}
+
 # --- Main ---
 COMMAND="${1:-}"
 [[ -n "$COMMAND" ]] && shift
@@ -1653,6 +1938,7 @@ case "$COMMAND" in
   sessions)   cmd_sessions "$@" ;;
   patterns)   cmd_patterns "$@" ;;
   diff)       cmd_diff "$@" ;;
+  narrate)    cmd_narrate "$@" ;;
   -h|--help|"") usage ;;
   *)
     echo "Unknown command: $COMMAND" >&2

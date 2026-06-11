@@ -33,8 +33,14 @@
 - [x] File hotspots with sole-author detection
 - [x] Branch lifecycle stats (lifespan, commits per branch)
 - [x] Tiered process sniffing (true=fast pgrep/ps, deep=lsof)
-- [ ] Pipe event data to LLM for narrative summaries
-- [ ] Process sniffing refinement based on dogfooding experience
+- [x] Commit-to-push latency (IC view of lead time)
+- [x] Rewrite frequency (amend/rebase rate — change failure rate analog)
+- [x] Commit granularity (files/lines per commit — PR size analog)
+- [x] Repo ownership concentration (specialist vs generalist)
+- [x] Session shape analysis (front-loaded vs back-loaded)
+- [x] AI tool presence tracking (tools running at commit time)
+- [x] Pipe event data to LLM for narrative summaries (`engsight narrate`, via `llm` CLI)
+- [x] Markdown export for summaries (`engsight narrate --md`)
 - [ ] Explore ccusage (https://github.com/ryoppippi/ccusage) integration — reads local AI tool session logs for token counts, costs, model usage. Could correlate AI spend with git activity.
 
 ## Phase 3: MCP Server

@@ -150,6 +150,17 @@ engsight diff --period 2025-01-01..2025-01-31 2025-02-01..2025-02-28  # Custom
 
 Side-by-side comparison of two time periods: commits, pushes, repos, branches, AI co-author rate, and repo changes (new/dropped).
 
+### narrate
+
+```bash
+engsight narrate --daily              # LLM narrative of today
+engsight narrate --weekly             # LLM narrative of the week (default)
+engsight narrate --weekly --md        # Output raw markdown (no LLM needed)
+engsight narrate --daily --prompt "Write this as a standup update"
+```
+
+Generates a structured markdown summary of your activity and pipes it to [llm](https://github.com/simonw/llm) for narrative generation. Use `--md` to get the raw markdown without the LLM step. Requires `llm` CLI unless using `--md`.
+
 ## Configuration
 
 Edit `~/.engsight/config` to customize:
