@@ -1448,6 +1448,63 @@ cmd_patterns() {
     fi
   fi
 
+  # --- AI Cost (ccusage) ---
+  if command -v ccusage >/dev/null 2>&1 || command -v bunx >/dev/null 2>&1; then
+    echo ""
+    echo "AI Cost (via ccusage)"
+    printf "%s\n" "────────────────────────────────────────────"
+
+    local ccusage_cmd="ccusage"
+    if ! command -v ccusage >/dev/null 2>&1; then
+      ccusage_cmd="bunx ccusage"
+    fi
+
+    local ccusage_json
+    ccusage_json="$(${ccusage_cmd} daily --json --since "$since" --until "$until_date" 2>/dev/null)"
+
+    if [[ -n "$ccusage_json" ]]; then
+      local cc_cost cc_tokens cc_input cc_output cc_cache_read cc_models
+      cc_cost="$(echo "$ccusage_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{d['totals']['totalCost']:.2f}\")" 2>/dev/null || echo "")"
+      cc_tokens="$(echo "$ccusage_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['totals']['totalTokens'])" 2>/dev/null || echo "")"
+      cc_input="$(echo "$ccusage_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['totals']['inputTokens'])" 2>/dev/null || echo "")"
+      cc_output="$(echo "$ccusage_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['totals']['outputTokens'])" 2>/dev/null || echo "")"
+      cc_cache_read="$(echo "$ccusage_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['totals']['cacheReadTokens'])" 2>/dev/null || echo "")"
+      cc_models="$(echo "$ccusage_json" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+for day in d.get('daily',[]):
+  for m in day.get('modelBreakdowns',[]):
+    print(f\"{m['modelName']}|{m['outputTokens']}|{m.get('cost',0):.2f}\")
+" 2>/dev/null | sort -t'|' -k3 -rn | head -5)"
+
+      if [[ -n "$cc_cost" ]]; then
+        printf "  • Total cost:           \$%s\n" "$cc_cost"
+        printf "  • Total tokens:         %s\n" "$(echo "$cc_tokens" | awk '{ printf "%\047d\n", $1 }' 2>/dev/null || cat)"
+        printf "  • Input tokens:         %s\n" "$(echo "$cc_input" | awk '{ printf "%\047d\n", $1 }' 2>/dev/null || cat)"
+        printf "  • Output tokens:        %s\n" "$(echo "$cc_output" | awk '{ printf "%\047d\n", $1 }' 2>/dev/null || cat)"
+        printf "  • Cache read tokens:    %s\n" "$(echo "$cc_cache_read" | awk '{ printf "%\047d\n", $1 }' 2>/dev/null || cat)"
+
+        if [[ "$commits" -gt 0 && -n "$cc_cost" ]]; then
+          local cost_per_commit
+          cost_per_commit="$(awk "BEGIN { printf \"%.2f\", ${cc_cost}/${commits} }")"
+          printf "  • Cost per commit:      \$%s\n" "$cost_per_commit"
+        fi
+
+        if [[ -n "$cc_models" ]]; then
+          echo ""
+          echo "  By model:"
+          echo "$cc_models" | while IFS='|' read -r mname moutput mcost; do
+            printf "    %-25s %s output tokens, \$%s\n" "$mname" "$(echo "$moutput" | awk '{ printf "%\047d\n", $1 }' 2>/dev/null || cat)" "$mcost"
+          done
+        fi
+      else
+        printf "  • No ccusage data for this period\n"
+      fi
+    else
+      printf "  • ccusage returned no data\n"
+    fi
+  fi
+
   # --- Process Context Trends ---
   # Source config to check process sniff setting
   if [[ -f "${ENGSIGHT_DIR}/config" ]]; then
@@ -1897,6 +1954,56 @@ cmd_narrate() {
       md+="- File types: ${file_type_list}"$'\n'
     fi
     md+=""$'\n'
+  fi
+
+  # ccusage cost data
+  if command -v ccusage >/dev/null 2>&1 || command -v bunx >/dev/null 2>&1; then
+    local cc_cmd="ccusage"
+    if ! command -v ccusage >/dev/null 2>&1; then cc_cmd="bunx ccusage"; fi
+
+    local cc_json
+    cc_json="$(${cc_cmd} daily --json --since "$since" --until "$until_date" 2>/dev/null)"
+    if [[ -n "$cc_json" ]]; then
+      local cc_cost cc_tokens cc_output
+      cc_cost="$(echo "$cc_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(f\"{d['totals']['totalCost']:.2f}\")" 2>/dev/null || echo "")"
+      cc_tokens="$(echo "$cc_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['totals']['totalTokens'])" 2>/dev/null || echo "")"
+      cc_output="$(echo "$cc_json" | python3 -c "import sys,json; d=json.load(sys.stdin); print(d['totals']['outputTokens'])" 2>/dev/null || echo "")"
+
+      if [[ -n "$cc_cost" && "$cc_cost" != "0.00" ]]; then
+        md+="## AI Cost (ccusage)"$'\n'
+        md+="- Total cost: \$${cc_cost}"$'\n'
+        md+="- Total tokens: ${cc_tokens}"$'\n'
+        md+="- Output tokens: ${cc_output}"$'\n'
+        if [[ "$commits" -gt 0 ]]; then
+          local cpc
+          cpc="$(awk "BEGIN { printf \"%.2f\", ${cc_cost}/${commits} }")"
+          md+="- Cost per commit: \$${cpc}"$'\n'
+        fi
+
+        # Model breakdown
+        local cc_models
+        cc_models="$(echo "$cc_json" | python3 -c "
+import sys,json
+d=json.load(sys.stdin)
+seen={}
+for day in d.get('daily',[]):
+  for m in day.get('modelBreakdowns',[]):
+    n=m['modelName']
+    if n not in seen: seen[n]={'out':0,'cost':0}
+    seen[n]['out']+=m['outputTokens']
+    seen[n]['cost']+=m.get('cost',0)
+for n,v in sorted(seen.items(),key=lambda x:-x[1]['cost']):
+  print(f\"{n}|{v['out']}|{v['cost']:.2f}\")
+" 2>/dev/null)"
+        if [[ -n "$cc_models" ]]; then
+          md+="- By model:"$'\n'
+          while IFS='|' read -r mname mout mcost; do
+            md+="  - ${mname}: ${mout} output tokens, \$${mcost}"$'\n'
+          done <<< "$cc_models"
+        fi
+        md+=""$'\n'
+      fi
+    fi
   fi
 
   # --- Output ---
