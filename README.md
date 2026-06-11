@@ -138,7 +138,17 @@ engsight patterns --weekly            # Last 7 days (default)
 engsight patterns --since 2025-01-01  # Custom start date
 ```
 
-Surfaces working patterns: context switching frequency, commit cadence (median/average gap between commits), session depth (deep work vs. shallow), AI-assisted vs. solo session comparison, and breadth of work (focus ratio, file type diversity, daily repo spread).
+Surfaces working patterns: context switching frequency, commit cadence (median/average gap between commits), session depth (deep work vs. shallow), AI-assisted vs. solo session comparison, breadth of work (focus ratio, file type diversity, daily repo spread), commit streaks, file hotspots (with sole-author detection), and branch lifecycle stats.
+
+### diff
+
+```bash
+engsight diff --weekly                # This week vs last week (default)
+engsight diff --monthly               # This month vs last month
+engsight diff --period 2025-01-01..2025-01-31 2025-02-01..2025-02-28  # Custom
+```
+
+Side-by-side comparison of two time periods: commits, pushes, repos, branches, AI co-author rate, and repo changes (new/dropped).
 
 ## Configuration
 

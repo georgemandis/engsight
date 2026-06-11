@@ -19,6 +19,7 @@ usage() {
   echo "  summary          Summarize activity for a time period"
   echo "  sessions         Reconstruct work sessions from event clusters"
   echo "  patterns         Surface working patterns and insights"
+  echo "  diff             Compare activity between two time periods"
   echo ""
   echo "Options for log:"
   echo "  --repo NAME      Filter by repo name"
@@ -47,6 +48,11 @@ usage() {
   echo "  --weekly         Analyze last 7 days (default)"
   echo "  --since DATE     Custom start date (YYYY-MM-DD)"
   echo "  --until DATE     Custom end date (YYYY-MM-DD, default: today)"
+  echo ""
+  echo "Options for diff:"
+  echo "  --weekly         Compare this week vs last week (default)"
+  echo "  --monthly        Compare this month vs last month"
+  echo "  --period A B     Compare two custom periods: A=YYYY-MM-DD..YYYY-MM-DD"
   echo ""
 }
 
@@ -975,6 +981,361 @@ cmd_patterns() {
       printf "    %s: %d repos, %d commits\n" "$day" "$drepos" "$dcommits"
     done
   fi
+
+  # --- Streaks ---
+  echo ""
+  echo "Streaks"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  # Get all days with commits (across all time, not just the period — streaks span periods)
+  local all_commit_days
+  all_commit_days="$(sqlite3 "$DB" "SELECT DISTINCT date(timestamp) FROM events WHERE event_type='commit' ORDER BY 1;")"
+
+  if [[ -n "$all_commit_days" ]]; then
+    local current_streak=0 longest_streak=0 streak_start="" longest_start="" longest_end=""
+    local prev_day="" today
+    today="$(_engsight_date_ago 0)"
+
+    while IFS= read -r day; do
+      if [[ -z "$prev_day" ]]; then
+        current_streak=1
+        streak_start="$day"
+      else
+        # Check if this day is exactly 1 day after prev_day
+        local prev_epoch day_epoch
+        prev_epoch="$(_engsight_to_epoch "${prev_day}T00:00:00Z")"
+        day_epoch="$(_engsight_to_epoch "${day}T00:00:00Z")"
+        local gap_days=$(( (day_epoch - prev_epoch) / 86400 ))
+
+        if [[ "$gap_days" -eq 1 ]]; then
+          current_streak=$(( current_streak + 1 ))
+        else
+          if [[ "$current_streak" -gt "$longest_streak" ]]; then
+            longest_streak="$current_streak"
+            longest_start="$streak_start"
+            longest_end="$prev_day"
+          fi
+          current_streak=1
+          streak_start="$day"
+        fi
+      fi
+      prev_day="$day"
+    done <<< "$all_commit_days"
+
+    # Final flush
+    if [[ "$current_streak" -gt "$longest_streak" ]]; then
+      longest_streak="$current_streak"
+      longest_start="$streak_start"
+      longest_end="$prev_day"
+    fi
+
+    # Is the current streak active (includes today or yesterday)?
+    local last_commit_day
+    last_commit_day="$(echo "$all_commit_days" | tail -1)"
+    local last_epoch today_epoch days_since
+    last_epoch="$(_engsight_to_epoch "${last_commit_day}T00:00:00Z")"
+    today_epoch="$(_engsight_to_epoch "${today}T00:00:00Z")"
+    days_since=$(( (today_epoch - last_epoch) / 86400 ))
+
+    if [[ "$days_since" -le 1 ]]; then
+      printf "  • Current streak:       %d days (since %s)\n" "$current_streak" "$streak_start"
+    else
+      printf "  • Current streak:       0 days (last commit: %s, %d days ago)\n" "$last_commit_day" "$days_since"
+    fi
+    printf "  • Longest streak:       %d days (%s to %s)\n" "$longest_streak" "$longest_start" "$longest_end"
+
+    local total_commit_days
+    total_commit_days="$(echo "$all_commit_days" | wc -l | tr -d ' ')"
+    printf "  • Total active days:    %d\n" "$total_commit_days"
+
+    # Days since last commit per repo (within period)
+    local stale_repos
+    stale_repos="$(sqlite3 "$DB" "
+      SELECT repo_name, MAX(date(timestamp)) as last_day,
+        CAST(julianday('now') - julianday(MAX(timestamp)) AS INTEGER) as days_ago
+      FROM events WHERE ${where} AND event_type='commit'
+      GROUP BY repo_name
+      HAVING days_ago > 3
+      ORDER BY days_ago DESC
+      LIMIT 10;")"
+
+    if [[ -n "$stale_repos" ]]; then
+      echo ""
+      echo "  Repos going quiet (no commits in 3+ days):"
+      echo "$stale_repos" | while IFS='|' read -r rname last_day days_ago; do
+        printf "    %-25s last commit %s (%d days ago)\n" "$rname" "$last_day" "$days_ago"
+      done
+    fi
+  fi
+
+  # --- File Hotspots ---
+  echo ""
+  echo "File Hotspots"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  if [[ "$commits" -gt 0 ]]; then
+    # Most frequently changed files across commits
+    local hotspot_data
+    hotspot_data="$(sqlite3 "$DB" "
+      SELECT value, COUNT(*) as touches
+      FROM events, json_each(json_extract(payload, '$.files'))
+      WHERE ${where} AND event_type='commit'
+      GROUP BY value
+      HAVING touches > 1
+      ORDER BY touches DESC
+      LIMIT 15;" 2>/dev/null)"
+
+    if [[ -n "$hotspot_data" ]]; then
+      printf "  %-45s %s\n" "File" "Commits"
+      echo "$hotspot_data" | while IFS='|' read -r filepath touches; do
+        # Truncate long paths
+        local display_path="$filepath"
+        if [[ ${#display_path} -gt 43 ]]; then
+          display_path="...${display_path: -40}"
+        fi
+        printf "  %-45s %d\n" "$display_path" "$touches"
+      done
+    else
+      printf "  • No files touched in multiple commits\n"
+    fi
+
+    # Sole-author detection: files only you touch
+    # (This is local-only data, so "sole author" = only author in engsight's history)
+    local sole_author_files
+    sole_author_files="$(sqlite3 "$DB" "
+      SELECT value, COUNT(*) as touches
+      FROM events, json_each(json_extract(payload, '$.files'))
+      WHERE event_type='commit'
+      GROUP BY value
+      HAVING touches >= 5 AND COUNT(DISTINCT author) = 1
+      ORDER BY touches DESC
+      LIMIT 10;" 2>/dev/null)"
+
+    if [[ -n "$sole_author_files" ]]; then
+      echo ""
+      echo "  Sole-author files (5+ commits, only you):"
+      echo "$sole_author_files" | while IFS='|' read -r filepath touches; do
+        local display_path="$filepath"
+        if [[ ${#display_path} -gt 43 ]]; then
+          display_path="...${display_path: -40}"
+        fi
+        printf "    %-43s %d commits\n" "$display_path" "$touches"
+      done
+    fi
+  fi
+
+  # --- Branch Lifecycle ---
+  echo ""
+  echo "Branch Lifecycle"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  # Find branches: first seen (checkout/commit) to last seen (push/merge)
+  local branch_data
+  branch_data="$(sqlite3 "$DB" "
+    SELECT repo_name || '/' || branch as full_branch,
+      MIN(timestamp) as first_seen,
+      MAX(timestamp) as last_seen,
+      CAST((julianday(MAX(timestamp)) - julianday(MIN(timestamp))) * 24 AS INTEGER) as hours_lived,
+      SUM(CASE WHEN event_type='commit' THEN 1 ELSE 0 END) as branch_commits,
+      SUM(CASE WHEN event_type='push' THEN 1 ELSE 0 END) as branch_pushes
+    FROM events
+    WHERE ${where} AND branch != 'main' AND branch != 'master'
+    GROUP BY full_branch
+    HAVING branch_commits > 0
+    ORDER BY hours_lived DESC
+    LIMIT 15;" 2>/dev/null)"
+
+  if [[ -n "$branch_data" ]]; then
+    printf "  %-35s %8s %8s %8s\n" "Branch" "Lifespan" "Commits" "Pushes"
+    printf "  %-35s %8s %8s %8s\n" "───────────────────────────────────" "────────" "────────" "────────"
+    echo "$branch_data" | while IFS='|' read -r full_branch first_seen last_seen hours_lived branch_commits branch_pushes; do
+      local lifespan
+      if [[ "$hours_lived" -lt 1 ]]; then
+        lifespan="<1h"
+      elif [[ "$hours_lived" -lt 24 ]]; then
+        lifespan="${hours_lived}h"
+      else
+        local days=$(( hours_lived / 24 ))
+        lifespan="${days}d"
+      fi
+
+      local display_branch="$full_branch"
+      if [[ ${#display_branch} -gt 33 ]]; then
+        display_branch="...${display_branch: -30}"
+      fi
+      printf "  %-35s %8s %8d %8d\n" "$display_branch" "$lifespan" "$branch_commits" "$branch_pushes"
+    done
+
+    # Average branch lifespan
+    local avg_hours
+    avg_hours="$(sqlite3 "$DB" "
+      SELECT AVG(hours_lived) FROM (
+        SELECT CAST((julianday(MAX(timestamp)) - julianday(MIN(timestamp))) * 24 AS INTEGER) as hours_lived
+        FROM events
+        WHERE ${where} AND branch != 'main' AND branch != 'master'
+        GROUP BY repo_name || '/' || branch
+        HAVING SUM(CASE WHEN event_type='commit' THEN 1 ELSE 0 END) > 0
+      );" 2>/dev/null)"
+
+    if [[ -n "$avg_hours" && "$avg_hours" != "" ]]; then
+      local avg_int
+      avg_int="$(awk "BEGIN { printf \"%.0f\", ${avg_hours} }")"
+      echo ""
+      if [[ "$avg_int" -lt 24 ]]; then
+        printf "  • Average branch lifespan: %sh\n" "$avg_int"
+      else
+        printf "  • Average branch lifespan: %sd\n" "$(( avg_int / 24 ))"
+      fi
+    fi
+  else
+    printf "  • No non-main branch activity in this period\n"
+  fi
+}
+
+# --- diff command ---
+
+# Helper: compute stats for a period, output as pipe-delimited values
+_engsight_period_stats() {
+  local ts_start="$1" ts_end="$2"
+  local where="timestamp >= '${ts_start}' AND timestamp <= '${ts_end}'"
+
+  local total commits checkouts pushes merges repos branches
+  local ai_commits active_days
+  total="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where};")"
+  commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit';")"
+  checkouts="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='checkout';")"
+  pushes="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='push';")"
+  merges="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='merge';")"
+  repos="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT repo_name) FROM events WHERE ${where};")"
+  branches="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT repo_name || '/' || branch) FROM events WHERE ${where};")"
+  ai_commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';" 2>/dev/null || echo 0)"
+  active_days="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT date(timestamp)) FROM events WHERE ${where};")"
+
+  echo "${total}|${commits}|${checkouts}|${pushes}|${merges}|${repos}|${branches}|${ai_commits}|${active_days}"
+}
+
+cmd_diff() {
+  _engsight_check_db
+
+  local mode="weekly" period_a="" period_b=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --weekly)   mode="weekly"; shift ;;
+      --monthly)  mode="monthly"; shift ;;
+      --period)   period_a="$2"; period_b="$3"; mode="custom"; shift 3 ;;
+      -h|--help)  usage; exit 0 ;;
+      *)          echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  local a_start a_end b_start b_end a_label b_label
+
+  case "$mode" in
+    weekly)
+      b_start="$(_engsight_date_ago 7)"
+      b_end="$(_engsight_date_ago 0)"
+      a_start="$(_engsight_date_ago 14)"
+      a_end="$(_engsight_date_ago 8)"
+      a_label="Last week (${a_start} to ${a_end})"
+      b_label="This week (${b_start} to ${b_end})"
+      ;;
+    monthly)
+      b_start="$(_engsight_date_ago 30)"
+      b_end="$(_engsight_date_ago 0)"
+      a_start="$(_engsight_date_ago 60)"
+      a_end="$(_engsight_date_ago 31)"
+      a_label="Prior month (${a_start} to ${a_end})"
+      b_label="This month (${b_start} to ${b_end})"
+      ;;
+    custom)
+      if [[ -z "$period_a" || -z "$period_b" ]]; then
+        echo "Error: --period requires two date ranges: YYYY-MM-DD..YYYY-MM-DD YYYY-MM-DD..YYYY-MM-DD" >&2
+        exit 1
+      fi
+      a_start="${period_a%%..*}"
+      a_end="${period_a##*..}"
+      b_start="${period_b%%..*}"
+      b_end="${period_b##*..}"
+      a_label="Period A (${a_start} to ${a_end})"
+      b_label="Period B (${b_start} to ${b_end})"
+      ;;
+  esac
+
+  local a_ts_start="${a_start}T00:00:00Z" a_ts_end="${a_end}T23:59:59Z"
+  local b_ts_start="${b_start}T00:00:00Z" b_ts_end="${b_end}T23:59:59Z"
+
+  local a_stats b_stats
+  a_stats="$(_engsight_period_stats "$a_ts_start" "$a_ts_end")"
+  b_stats="$(_engsight_period_stats "$b_ts_start" "$b_ts_end")"
+
+  IFS='|' read -r a_total a_commits a_checkouts a_pushes a_merges a_repos a_branches a_ai a_days <<< "$a_stats"
+  IFS='|' read -r b_total b_commits b_checkouts b_pushes b_merges b_repos b_branches b_ai b_days <<< "$b_stats"
+
+  echo "Diff"
+  printf "%s\n" "════════════════════════════════════════════════════════════"
+  echo "  A: ${a_label}"
+  echo "  B: ${b_label}"
+  echo ""
+
+  # Delta display helper
+  _diff_line() {
+    local label="$1" a_val="$2" b_val="$3"
+    local delta=$(( b_val - a_val ))
+    local arrow=""
+    if [[ "$delta" -gt 0 ]]; then
+      arrow="(+${delta})"
+    elif [[ "$delta" -lt 0 ]]; then
+      arrow="(${delta})"
+    else
+      arrow="(=)"
+    fi
+    printf "  %-24s %8s %8s   %s\n" "$label" "$a_val" "$b_val" "$arrow"
+  }
+
+  printf "  %-24s %8s %8s   %s\n" "" "A" "B" "Delta"
+  printf "  %-24s %8s %8s   %s\n" "────────────────────────" "────────" "────────" "─────────"
+  _diff_line "Total events" "$a_total" "$b_total"
+  _diff_line "Commits" "$a_commits" "$b_commits"
+  _diff_line "Branch switches" "$a_checkouts" "$b_checkouts"
+  _diff_line "Pushes" "$a_pushes" "$b_pushes"
+  _diff_line "Merges" "$a_merges" "$b_merges"
+  _diff_line "Active repos" "$a_repos" "$b_repos"
+  _diff_line "Active branches" "$a_branches" "$b_branches"
+  _diff_line "AI co-authored commits" "$a_ai" "$b_ai"
+  _diff_line "Active days" "$a_days" "$b_days"
+
+  # AI percentage comparison
+  if [[ "$a_commits" -gt 0 || "$b_commits" -gt 0 ]]; then
+    echo ""
+    local a_ai_pct=0 b_ai_pct=0
+    [[ "$a_commits" -gt 0 ]] && a_ai_pct="$(awk "BEGIN { printf \"%.0f\", (${a_ai}/${a_commits})*100 }")"
+    [[ "$b_commits" -gt 0 ]] && b_ai_pct="$(awk "BEGIN { printf \"%.0f\", (${b_ai}/${b_commits})*100 }")"
+    local pct_delta=$(( b_ai_pct - a_ai_pct ))
+    local pct_arrow=""
+    if [[ "$pct_delta" -gt 0 ]]; then pct_arrow="(+${pct_delta}pp)"
+    elif [[ "$pct_delta" -lt 0 ]]; then pct_arrow="(${pct_delta}pp)"
+    else pct_arrow="(=)"; fi
+    printf "  %-24s %7s%% %7s%%   %s\n" "AI co-author rate" "$a_ai_pct" "$b_ai_pct" "$pct_arrow"
+  fi
+
+  # Repos that appeared/disappeared
+  local a_repo_list b_repo_list
+  a_repo_list="$(sqlite3 "$DB" "SELECT DISTINCT repo_name FROM events WHERE timestamp >= '${a_ts_start}' AND timestamp <= '${a_ts_end}';" 2>/dev/null | sort)"
+  b_repo_list="$(sqlite3 "$DB" "SELECT DISTINCT repo_name FROM events WHERE timestamp >= '${b_ts_start}' AND timestamp <= '${b_ts_end}';" 2>/dev/null | sort)"
+
+  local new_repos="" dropped_repos=""
+  if [[ -n "$a_repo_list" || -n "$b_repo_list" ]]; then
+    new_repos="$(comm -13 <(echo "$a_repo_list") <(echo "$b_repo_list") 2>/dev/null | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')"
+    dropped_repos="$(comm -23 <(echo "$a_repo_list") <(echo "$b_repo_list") 2>/dev/null | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')"
+  fi
+
+  if [[ -n "$new_repos" || -n "$dropped_repos" ]]; then
+    echo ""
+    echo "  Repo changes:"
+    if [[ -n "$new_repos" ]]; then printf "    New in B:     %s\n" "$new_repos"; fi
+    if [[ -n "$dropped_repos" ]]; then printf "    Dropped in B: %s\n" "$dropped_repos"; fi
+  fi
 }
 
 # --- Main ---
@@ -990,6 +1351,7 @@ case "$COMMAND" in
   summary)    cmd_summary "$@" ;;
   sessions)   cmd_sessions "$@" ;;
   patterns)   cmd_patterns "$@" ;;
+  diff)       cmd_diff "$@" ;;
   -h|--help|"") usage ;;
   *)
     echo "Unknown command: $COMMAND" >&2

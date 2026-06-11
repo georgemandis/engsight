@@ -28,6 +28,11 @@
 - [x] Session reconstruction: group events into "work sessions" (`engsight sessions`)
 - [x] Working patterns: context switching, commit cadence, session depth, breadth (`engsight patterns`)
 - [x] AI correlation: AI-assisted vs solo session comparison
+- [x] Period comparison: side-by-side diff of two time ranges (`engsight diff`)
+- [x] Commit streaks and momentum tracking
+- [x] File hotspots with sole-author detection
+- [x] Branch lifecycle stats (lifespan, commits per branch)
+- [x] Tiered process sniffing (true=fast pgrep/ps, deep=lsof)
 - [ ] Pipe event data to LLM for narrative summaries
 - [ ] Process sniffing refinement based on dogfooding experience
 - [ ] Explore ccusage (https://github.com/ryoppippi/ccusage) integration — reads local AI tool session logs for token counts, costs, model usage. Could correlate AI spend with git activity.
