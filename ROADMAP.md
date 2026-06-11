@@ -15,15 +15,15 @@
 - [x] End-to-end smoke test (`test.sh`)
 - [x] Dogfooding: installed across 95 Recurse Center repos
 
-## Phase 1: Query & Explore
+## Phase 1: Query & Explore (Complete)
 
 - [x] Basic query scripts (`engsight log`, `engsight summary`, `engsight repos`)
 - [x] Weekly/daily/custom summary generation
 - [x] Simple report: "what did I work on this week?" (`engsight summary --weekly`)
-- [ ] Cross-repo activity timeline
-- [ ] Markdown export for summaries
+- [x] Cross-repo activity timeline (`engsight log` spans all repos)
+- [x] Markdown export for summaries (`engsight narrate --md`)
 
-## Phase 2: AI Analysis
+## Phase 2: AI Analysis (Complete)
 
 - [x] Session reconstruction: group events into "work sessions" (`engsight sessions`)
 - [x] Working patterns: context switching, commit cadence, session depth, breadth (`engsight patterns`)
@@ -41,21 +41,21 @@
 - [x] AI tool presence tracking (tools running at commit time)
 - [x] Pipe event data to LLM for narrative summaries (`engsight narrate`, via `llm` CLI)
 - [x] Markdown export for summaries (`engsight narrate --md`)
-- [ ] Explore ccusage (https://github.com/ryoppippi/ccusage) integration — reads local AI tool session logs for token counts, costs, model usage. Could correlate AI spend with git activity.
+- [x] ccusage integration — AI cost/token data queried at report time via `bunx ccusage` (`engsight narrate`, `engsight patterns`)
 
-## Phase 3: MCP Server
+## Phase 3: MCP Server (Complete)
 
-- [ ] MCP server that reads from `engsight.db`
-- [ ] Natural language queries about work patterns ("what did I do last Tuesday?")
-- [ ] Integration with Claude Code for self-aware development assistance
-- [ ] Comparative analysis ("how does this week compare to last?")
+- [x] MCP server that reads from `engsight.db` (`mcp/index.ts`, Bun + @modelcontextprotocol/sdk)
+- [x] Natural language queries about work patterns (7 tools: log, repos, summary, sessions, patterns, diff, query)
+- [x] Integration with Claude Code for self-aware development assistance
+- [x] Comparative analysis (`engsight_diff` tool — weekly, monthly, custom periods)
 
 ## Phase 4: Enrichment & Collaboration
 
-- [ ] Optional GitHub/GitLab enrichment layer (PR data, reviews, CI status)
-- [ ] Export formats for sharing (standup summaries, performance review material)
-- [ ] Potential integration points with engleader.tools
-- [ ] Multi-machine sync (if relevant)
+- [x] GitHub enrichment via `gh` CLI (`engsight enrich` — PRs authored, reviews given, commits/PR ratio)
+- [x] Export formats: `engsight narrate --format standup` and `--format review`
+- [x] engleader.tools bridge: enrichment correlates local git data with same PR/review signals
+- [ ] Multi-machine sync (if relevant — let dogfooding determine need)
 
 ## Blog Posts
 

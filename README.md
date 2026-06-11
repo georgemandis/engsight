@@ -89,6 +89,7 @@ engsight status        # Show hook status and event count for current repo
 engsight log           # Show recent events across all repos
 engsight repos         # List repos with activity counts
 engsight summary       # Summarize activity for a time period
+engsight enrich        # Correlate local activity with GitHub PRs (requires gh)
 ```
 
 ### log
@@ -157,9 +158,21 @@ engsight narrate --daily              # LLM narrative of today
 engsight narrate --weekly             # LLM narrative of the week (default)
 engsight narrate --weekly --md        # Output raw markdown (no LLM needed)
 engsight narrate --daily --prompt "Write this as a standup update"
+engsight narrate --weekly --format standup   # Preset: standup update
+engsight narrate --weekly --format review    # Preset: performance review material
 ```
 
 Generates a structured markdown summary of your activity and pipes it to [llm](https://github.com/simonw/llm) for narrative generation. Use `--md` to get the raw markdown without the LLM step. Requires `llm` CLI unless using `--md`.
+
+### enrich
+
+```bash
+engsight enrich                       # GitHub enrichment for last 7 days
+engsight enrich --daily               # Today's GitHub activity
+engsight enrich --repo myproject      # Filter by repo
+```
+
+Correlates local git activity with GitHub PR data: PRs authored, reviews given, commits-per-PR ratio. Requires `gh` CLI authenticated with GitHub.
 
 ## Configuration
 
@@ -171,9 +184,42 @@ Edit `~/.engsight/config` to customize:
 - **Excluded repos** — skip repos you don't want to track
 - **Terminal/workdir/time capture** — all enabled by default
 
+## MCP Server
+
+engsight includes an MCP (Model Context Protocol) server that lets Claude Code query your engineering data directly. This enables natural language queries like "what did I work on last Tuesday?" or "how does this week compare to last?".
+
+### Setup
+
+Requires [Bun](https://bun.sh).
+
+```bash
+cd mcp
+bun install
+```
+
+Add to Claude Code with the CLI:
+
+```bash
+claude mcp add engsight -s user -- bun run /path/to/engsight/mcp/index.ts
+```
+
+The `-s user` flag makes it available globally across all projects. Use `-s project` instead to scope it to a single repo.
+
+### Available tools
+
+| Tool | Description |
+|------|-------------|
+| `engsight_log` | Recent events across all repos |
+| `engsight_repos` | Repos with activity counts |
+| `engsight_summary` | Activity summary for a time period |
+| `engsight_sessions` | Work session reconstruction |
+| `engsight_patterns` | Working patterns and insights |
+| `engsight_diff` | Compare two time periods |
+| `engsight_query` | Raw SQL escape hatch |
+
 ## Querying the data
 
-Currently: direct SQLite queries. Some examples:
+You can also query the SQLite database directly:
 
 ```bash
 # What repos have I been active in today?

@@ -21,6 +21,7 @@ usage() {
   echo "  patterns         Surface working patterns and insights"
   echo "  diff             Compare activity between two time periods"
   echo "  narrate          Generate an LLM narrative of your activity (requires llm)"
+  echo "  enrich           Correlate local activity with GitHub PR data (requires gh)"
   echo ""
   echo "Options for log:"
   echo "  --repo NAME      Filter by repo name"
@@ -62,6 +63,14 @@ usage() {
   echo "  --until DATE     Custom end date (YYYY-MM-DD, default: today)"
   echo "  --md             Output raw markdown instead of piping to llm"
   echo "  --prompt TEXT    Override the default system prompt"
+  echo "  --format FORMAT  Use a preset prompt: standup, review"
+  echo ""
+  echo "Options for enrich:"
+  echo "  --daily          Enrich today's activity"
+  echo "  --weekly         Enrich last 7 days (default)"
+  echo "  --since DATE     Custom start date (YYYY-MM-DD)"
+  echo "  --until DATE     Custom end date (YYYY-MM-DD, default: today)"
+  echo "  --repo NAME      Filter by repo name"
   echo ""
 }
 
@@ -435,75 +444,107 @@ cmd_summary() {
     printf "  %-25s %d commits (%d events)\n" "$rname" "$rcommits" "$revents"
   done < <(sqlite3 "$DB" "SELECT repo_name, SUM(CASE WHEN event_type='commit' THEN 1 ELSE 0 END), COUNT(*) FROM events WHERE ${where} GROUP BY repo_name ORDER BY 2 DESC;")
 
-  # AI co-authorship breakdown
+  # AI Signatures
   echo ""
-  echo "AI Co-authorship"
+  echo "AI Signatures"
   printf "%s\n" "────────────────────────────────────────────"
 
-  local ai_commits
-  ai_commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';")"
-
   if [[ "$commits" -gt 0 ]]; then
-    local ai_pct
-    ai_pct="$(awk "BEGIN { printf \"%.0f\", (${ai_commits}/${commits})*100 }")"
-    printf "  • AI co-authored:     %d / %d commits (%s%%)\n" "$ai_commits" "$commits" "$ai_pct"
-  else
-    printf "  • AI co-authored:     0 commits\n"
-  fi
+    # Tier 1: Explicit co-authorship
+    local ai_explicit
+    ai_explicit="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';")"
+    printf "  • Explicit co-authorship: %d / %d commits\n" "$ai_explicit" "$commits"
 
-  # Break down by co-author name
-  local coauthor_data
-  coauthor_data="$(sqlite3 "$DB" "
-    SELECT value FROM events, json_each(json_extract(payload, '$.ai_commit_signals.co_authored_by'))
-    WHERE ${where} AND event_type='commit'
-    AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';" 2>/dev/null || echo "")"
+    # Break down by co-author name
+    if [[ "$ai_explicit" -gt 0 ]]; then
+      local coauthor_data
+      coauthor_data="$(sqlite3 "$DB" "
+        SELECT value FROM events, json_each(json_extract(payload, '$.ai_commit_signals.co_authored_by'))
+        WHERE ${where} AND event_type='commit'
+        AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';" 2>/dev/null || echo "")"
+      if [[ -n "$coauthor_data" ]]; then
+        echo "$coauthor_data" | sort | uniq -c | sort -rn | while read -r count name; do
+          printf "    %-20s %d commits\n" "$name" "$count"
+        done
+      fi
+    fi
 
-  if [[ -n "$coauthor_data" ]]; then
-    echo ""
-    echo "  By tool:"
-    echo "$coauthor_data" | sort | uniq -c | sort -rn | while read -r count name; do
-      printf "    %-20s %d commits\n" "$name" "$count"
-    done
-  fi
+    # Tier 2: AI tools running at commit time
+    local ai_process
+    ai_process="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0;" 2>/dev/null || echo 0)"
+    printf "  • AI tools running:       %d / %d commits\n" "$ai_process" "$commits"
 
-  # Pattern matches
-  local pattern_data
-  pattern_data="$(sqlite3 "$DB" "
-    SELECT value FROM events, json_each(json_extract(payload, '$.ai_commit_signals.pattern_matches'))
-    WHERE ${where} AND event_type='commit'
-    AND json_extract(payload, '$.ai_commit_signals.pattern_matches') != '[]';" 2>/dev/null || echo "")"
+    # Tool breakdown
+    if [[ "$ai_process" -gt 0 ]]; then
+      local tool_names
+      tool_names="$(sqlite3 "$DB" "
+        SELECT json_extract(value, '$.name'), COUNT(*) FROM events,
+          json_each(json_extract(payload, '$.process_context.active_ai_tools'))
+        WHERE ${where} AND event_type='commit'
+        GROUP BY 1 ORDER BY 2 DESC;" 2>/dev/null)"
+      if [[ -n "$tool_names" ]]; then
+        while IFS='|' read -r tname tcount; do
+          printf "    %-20s %d commits\n" "$tname" "$tcount"
+        done <<< "$tool_names"
+      fi
+    fi
 
-  if [[ -n "$pattern_data" ]]; then
-    echo ""
-    echo "  Patterns detected:"
-    echo "$pattern_data" | sort | uniq -c | sort -rn | while read -r count pattern; do
-      printf "    %-30s %d matches\n" "$pattern" "$count"
-    done
-  fi
-
-  # AI artifacts presence
-  local repos_with_artifacts
-  repos_with_artifacts="$(sqlite3 "$DB" "
-    SELECT DISTINCT repo_name FROM events
-    WHERE ${where} AND event_type='pre_commit'
-    AND json_extract(payload, '$.ai_artifacts') != '{}';" 2>/dev/null || echo "")"
-
-  if [[ -n "$repos_with_artifacts" ]]; then
-    echo ""
-    echo "  Repos with AI artifacts:"
-    echo "$repos_with_artifacts" | while read -r rname; do
-      # Get the most recent artifact scan for this repo
-      local artifacts
-      artifacts="$(sqlite3 "$DB" "
-        SELECT json_extract(payload, '$.ai_artifacts') FROM events
-        WHERE ${where} AND event_type='pre_commit' AND repo_name='${rname}'
+    # Tier 3: AI artifacts present in repo
+    local ai_artifact_commits
+    ai_artifact_commits="$(sqlite3 "$DB" "
+      SELECT COUNT(DISTINCT e.id) FROM events e
+      INNER JOIN (
+        SELECT repo_name, MAX(timestamp) as max_ts
+        FROM events WHERE ${where} AND event_type='pre_commit'
         AND json_extract(payload, '$.ai_artifacts') != '{}'
-        ORDER BY timestamp DESC LIMIT 1;" 2>/dev/null || echo "{}")"
-      # List artifact keys
-      local keys
-      keys="$(sqlite3 :memory: "SELECT key FROM json_each('${artifacts}');" 2>/dev/null | paste -sd', ' -)"
-      printf "    %-25s %s\n" "$rname" "$keys"
-    done
+        GROUP BY repo_name
+      ) a ON e.repo_name = a.repo_name
+      WHERE ${where} AND e.event_type='commit';" 2>/dev/null || echo 0)"
+    local repos_with_artifacts
+    repos_with_artifacts="$(sqlite3 "$DB" "
+      SELECT DISTINCT repo_name FROM events
+      WHERE ${where} AND event_type='pre_commit'
+      AND json_extract(payload, '$.ai_artifacts') != '{}';" 2>/dev/null || echo "")"
+    local artifact_repo_count=0
+    if [[ -n "$repos_with_artifacts" ]]; then
+      artifact_repo_count="$(echo "$repos_with_artifacts" | wc -l | tr -d ' ')"
+    fi
+    printf "  • AI artifacts present:   %d repos\n" "$artifact_repo_count"
+
+    if [[ -n "$repos_with_artifacts" ]]; then
+      echo "$repos_with_artifacts" | while read -r rname; do
+        [[ -z "$rname" ]] && continue
+        local artifacts
+        artifacts="$(sqlite3 "$DB" "
+          SELECT json_extract(payload, '$.ai_artifacts') FROM events
+          WHERE ${where} AND event_type='pre_commit' AND repo_name='${rname}'
+          AND json_extract(payload, '$.ai_artifacts') != '{}'
+          ORDER BY timestamp DESC LIMIT 1;" 2>/dev/null || echo "{}")"
+        local keys
+        keys="$(sqlite3 :memory: "SELECT key FROM json_each('${artifacts}');" 2>/dev/null | paste -sd', ' -)"
+        printf "    %-20s %s\n" "$rname" "$keys"
+      done
+    fi
+
+    # Combined: any AI signal
+    local ai_combined
+    ai_combined="$(sqlite3 "$DB" "
+      SELECT COUNT(*) FROM events
+      WHERE ${where} AND event_type='commit' AND (
+        json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
+        OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0
+        OR repo_name IN (
+          SELECT DISTINCT repo_name FROM events
+          WHERE ${where} AND event_type='pre_commit'
+          AND json_extract(payload, '$.ai_artifacts') != '{}'
+        )
+      );" 2>/dev/null || echo 0)"
+    local combined_pct
+    combined_pct="$(awk "BEGIN { printf \"%.0f\", (${ai_combined}/${commits})*100 }")"
+    echo ""
+    printf "  Combined: %d / %d commits (%s%%) had AI signatures\n" "$ai_combined" "$commits" "$combined_pct"
+  else
+    printf "  • No commits to analyze\n"
   fi
 
   # Time patterns
@@ -564,7 +605,14 @@ cmd_sessions() {
 
   # Pull all events sorted by time
   local events_data
-  events_data="$(sqlite3 "$DB" "SELECT timestamp, event_type, repo_name, branch, json_extract(payload, '$.ai_commit_signals.co_authored_by') FROM events WHERE ${where} ORDER BY timestamp ASC;")"
+  # Build set of repos with AI artifacts in this period
+  local artifact_repos
+  artifact_repos="$(sqlite3 "$DB" "
+    SELECT DISTINCT repo_name FROM events
+    WHERE ${where} AND event_type='pre_commit'
+    AND json_extract(payload, '$.ai_artifacts') != '{}';" 2>/dev/null || echo "")"
+
+  events_data="$(sqlite3 "$DB" "SELECT timestamp, event_type, repo_name, branch, json_extract(payload, '$.ai_commit_signals.co_authored_by'), json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) FROM events WHERE ${where} ORDER BY timestamp ASC;")"
 
   if [[ -z "$events_data" ]]; then
     echo "No events from ${since} to ${until_date}."
@@ -590,7 +638,7 @@ cmd_sessions() {
     sessions+=("${s_start}|${s_end}|${duration}|${repo_list}|${repo_count}|${s_commits}|${s_checkouts}|${s_ai_commits}|${s_events}|${branch_list}")
   }
 
-  while IFS='|' read -r ts etype rname branch ai_coauthors; do
+  while IFS='|' read -r ts etype rname branch ai_coauthors ai_tool_count; do
     local epoch
     epoch="$(_engsight_to_epoch "$ts")"
 
@@ -616,7 +664,12 @@ cmd_sessions() {
 
     if [[ "$etype" == "commit" ]]; then
       s_commits=$(( s_commits + 1 ))
-      if [[ -n "$ai_coauthors" && "$ai_coauthors" != "[]" ]]; then
+      # AI signature: any of co-authorship, process presence, or artifact presence
+      local has_ai=false
+      if [[ -n "$ai_coauthors" && "$ai_coauthors" != "[]" ]]; then has_ai=true; fi
+      if [[ "${ai_tool_count:-0}" -gt 0 ]]; then has_ai=true; fi
+      if echo "$artifact_repos" | grep -qx "$rname" 2>/dev/null; then has_ai=true; fi
+      if [[ "$has_ai" == "true" ]]; then
         s_ai_commits=$(( s_ai_commits + 1 ))
       fi
     fi
@@ -720,8 +773,15 @@ cmd_patterns() {
   printf "%s\n" "════════════════════════════════════════════════════════════"
 
   # --- Reconstruct sessions for analysis ---
+  # Build set of repos with AI artifacts in this period
+  local artifact_repos
+  artifact_repos="$(sqlite3 "$DB" "
+    SELECT DISTINCT repo_name FROM events
+    WHERE ${where} AND event_type='pre_commit'
+    AND json_extract(payload, '$.ai_artifacts') != '{}';" 2>/dev/null || echo "")"
+
   local events_data
-  events_data="$(sqlite3 "$DB" "SELECT timestamp, event_type, repo_name, branch, json_extract(payload, '$.ai_commit_signals.co_authored_by'), json_extract(payload, '$.files_changed') FROM events WHERE ${where} ORDER BY timestamp ASC;")"
+  events_data="$(sqlite3 "$DB" "SELECT timestamp, event_type, repo_name, branch, json_extract(payload, '$.ai_commit_signals.co_authored_by'), json_extract(payload, '$.files_changed'), json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) FROM events WHERE ${where} ORDER BY timestamp ASC;")"
 
   # Session reconstruction (same logic as cmd_sessions)
   local -a sess_durations=() sess_commits=() sess_ai_commits=() sess_repo_counts=()
@@ -747,7 +807,7 @@ cmd_patterns() {
     sess_repos_list+=("$repo_list")
   }
 
-  while IFS='|' read -r ts etype rname branch ai_coauthors files_changed; do
+  while IFS='|' read -r ts etype rname branch ai_coauthors files_changed ai_tool_count; do
     local epoch
     epoch="$(_engsight_to_epoch "$ts")"
 
@@ -772,7 +832,12 @@ cmd_patterns() {
     if [[ "$etype" == "commit" ]]; then
       s_commits=$(( s_commits + 1 ))
       s_files=$(( s_files + ${files_changed:-0} ))
-      if [[ -n "$ai_coauthors" && "$ai_coauthors" != "[]" ]]; then
+      # AI signature: any of co-authorship, process presence, or artifact presence
+      local has_ai=false
+      if [[ -n "$ai_coauthors" && "$ai_coauthors" != "[]" ]]; then has_ai=true; fi
+      if [[ "${ai_tool_count:-0}" -gt 0 ]]; then has_ai=true; fi
+      if echo "$artifact_repos" | grep -qx "$rname" 2>/dev/null; then has_ai=true; fi
+      if [[ "$has_ai" == "true" ]]; then
         s_ai_commits=$(( s_ai_commits + 1 ))
       fi
     fi
@@ -1575,7 +1640,17 @@ _engsight_period_stats() {
   merges="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='merge';")"
   repos="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT repo_name) FROM events WHERE ${where};")"
   branches="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT repo_name || '/' || branch) FROM events WHERE ${where};")"
-  ai_commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';" 2>/dev/null || echo 0)"
+  ai_commits="$(sqlite3 "$DB" "
+    SELECT COUNT(*) FROM events
+    WHERE ${where} AND event_type='commit' AND (
+      json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
+      OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0
+      OR repo_name IN (
+        SELECT DISTINCT repo_name FROM events
+        WHERE ${where} AND event_type='pre_commit'
+        AND json_extract(payload, '$.ai_artifacts') != '{}'
+      )
+    );" 2>/dev/null || echo 0)"
   active_days="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT date(timestamp)) FROM events WHERE ${where};")"
 
   echo "${total}|${commits}|${checkouts}|${pushes}|${merges}|${repos}|${branches}|${ai_commits}|${active_days}"
@@ -1669,7 +1744,7 @@ cmd_diff() {
   _diff_line "Merges" "$a_merges" "$b_merges"
   _diff_line "Active repos" "$a_repos" "$b_repos"
   _diff_line "Active branches" "$a_branches" "$b_branches"
-  _diff_line "AI co-authored commits" "$a_ai" "$b_ai"
+  _diff_line "AI signature commits" "$a_ai" "$b_ai"
   _diff_line "Active days" "$a_days" "$b_days"
 
   # AI percentage comparison
@@ -1683,7 +1758,7 @@ cmd_diff() {
     if [[ "$pct_delta" -gt 0 ]]; then pct_arrow="(+${pct_delta}pp)"
     elif [[ "$pct_delta" -lt 0 ]]; then pct_arrow="(${pct_delta}pp)"
     else pct_arrow="(=)"; fi
-    printf "  %-24s %7s%% %7s%%   %s\n" "AI co-author rate" "$a_ai_pct" "$b_ai_pct" "$pct_arrow"
+    printf "  %-24s %7s%% %7s%%   %s\n" "AI signature rate" "$a_ai_pct" "$b_ai_pct" "$pct_arrow"
   fi
 
   # Repos that appeared/disappeared
@@ -1723,10 +1798,36 @@ Do not hallucinate details that aren't in the data. If the data is thin, say so 
 PROMPT
 }
 
+_engsight_standup_prompt() {
+  cat <<'PROMPT'
+Turn this engineering activity data into a concise standup update. Format:
+
+**Yesterday/Today:** What was worked on (repos, features, key commits).
+**Next:** Based on momentum, what likely comes next.
+**Blockers:** Only if the data suggests any (stale branches, high churn, context thrashing).
+
+Keep it to 3-5 sentences total. Use repo and branch names. Skip sections with nothing to say.
+PROMPT
+}
+
+_engsight_review_prompt() {
+  cat <<'PROMPT'
+Turn this engineering activity data into material for a performance review or self-assessment. Structure:
+
+**Scope of Work:** Repos and features touched, breadth vs depth.
+**Productivity Patterns:** Commit cadence, session patterns, consistency.
+**Technical Contributions:** File hotspots, areas of ownership, code volume.
+**Collaboration & Tools:** AI co-authorship patterns, tool usage.
+**Growth Signals:** New repos explored, branch lifecycle, iteration patterns.
+
+Be factual and specific. Use numbers from the data. Frame observations constructively. This is self-reflection material, not a final review — help the person see their own patterns clearly.
+PROMPT
+}
+
 cmd_narrate() {
   _engsight_check_db
 
-  local since="" until_date="" mode="weekly" md_only=false custom_prompt=""
+  local since="" until_date="" mode="weekly" md_only=false custom_prompt="" format=""
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1735,6 +1836,7 @@ cmd_narrate() {
       --since)    since="$2"; mode="custom"; shift 2 ;;
       --until)    until_date="$2"; shift 2 ;;
       --md)       md_only=true; shift ;;
+      --format)   format="$2"; shift 2 ;;
       --prompt)   custom_prompt="$2"; shift 2 ;;
       -h|--help)  usage; exit 0 ;;
       *)          echo "Unknown option: $1" >&2; exit 1 ;;
@@ -1805,57 +1907,71 @@ cmd_narrate() {
     ORDER BY timestamp DESC LIMIT 20;")
   md+=""$'\n'
 
-  # AI co-authorship
-  local ai_commits
-  ai_commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';")"
-  md+="## AI Usage"$'\n'
+  # AI Signatures
+  md+="## AI Signatures"$'\n'
   if [[ "$commits" -gt 0 ]]; then
-    local ai_pct
-    ai_pct="$(awk "BEGIN { printf \"%.0f\", (${ai_commits}/${commits})*100 }")"
-    md+="- ${ai_commits} / ${commits} commits (${ai_pct}%) had AI co-authors"$'\n'
-  fi
+    # Tier 1: Explicit co-authorship
+    local ai_explicit
+    ai_explicit="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';")"
+    md+="- Explicit co-authorship: ${ai_explicit} / ${commits} commits"$'\n'
 
-  # Co-author breakdown
-  local coauthor_data
-  coauthor_data="$(sqlite3 "$DB" "
-    SELECT value, COUNT(*) FROM events, json_each(json_extract(payload, '$.ai_commit_signals.co_authored_by'))
-    WHERE ${where} AND event_type='commit'
-    AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
-    GROUP BY value ORDER BY 2 DESC;" 2>/dev/null)"
-  if [[ -n "$coauthor_data" ]]; then
-    md+="- By tool:"$'\n'
-    echo "$coauthor_data" | while IFS='|' read -r name count; do
-      md+="  - ${name}: ${count} commits"$'\n'
-      echo "  - ${name}: ${count} commits"
-    done | while read -r line; do true; done
-    # Re-read for proper append
-    while IFS='|' read -r name count; do
-      md+="  - ${name}: ${count} commits"$'\n'
-    done <<< "$coauthor_data"
-  fi
-
-  # Process context
-  if [[ -f "${ENGSIGHT_DIR}/config" ]]; then
-    source "${ENGSIGHT_DIR}/config" 2>/dev/null
-  fi
-  if [[ "${ENGSIGHT_PROCESS_SNIFF:-false}" == "true" || "${ENGSIGHT_PROCESS_SNIFF:-false}" == "deep" ]]; then
-    local tool_presence
-    tool_presence="$(sqlite3 "$DB" "
-      SELECT json_extract(value, '$.name'),
-        COUNT(*),
-        AVG(CAST(json_extract(value, '$.instances') AS REAL)),
-        AVG(CAST(json_extract(value, '$.total_memory_mb') AS INTEGER))
-      FROM events, json_each(json_extract(payload, '$.process_context.active_ai_tools'))
-      WHERE ${where} AND event_type='commit'
-      GROUP BY 1 ORDER BY 2 DESC;" 2>/dev/null)"
-    if [[ -n "$tool_presence" ]]; then
-      md+="- Tools running at commit time:"$'\n'
-      while IFS='|' read -r tname tcount tinst tmem; do
-        local inst_display
-        inst_display="$(awk "BEGIN { printf \"%.1f\", ${tinst:-0} }")"
-        md+="  - ${tname}: present during ${tcount} commits (avg ${inst_display} instances, ~${tmem:-0}MB)"$'\n'
-      done <<< "$tool_presence"
+    if [[ "$ai_explicit" -gt 0 ]]; then
+      local coauthor_data
+      coauthor_data="$(sqlite3 "$DB" "
+        SELECT value, COUNT(*) FROM events, json_each(json_extract(payload, '$.ai_commit_signals.co_authored_by'))
+        WHERE ${where} AND event_type='commit'
+        AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
+        GROUP BY value ORDER BY 2 DESC;" 2>/dev/null)"
+      if [[ -n "$coauthor_data" ]]; then
+        while IFS='|' read -r name count; do
+          md+="  - ${name}: ${count} commits"$'\n'
+        done <<< "$coauthor_data"
+      fi
     fi
+
+    # Tier 2: AI tools running at commit time
+    local ai_process
+    ai_process="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='commit' AND json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0;" 2>/dev/null || echo 0)"
+    md+="- AI tools running: ${ai_process} / ${commits} commits"$'\n'
+
+    if [[ "$ai_process" -gt 0 ]]; then
+      local tool_presence
+      tool_presence="$(sqlite3 "$DB" "
+        SELECT json_extract(value, '$.name'), COUNT(*)
+        FROM events, json_each(json_extract(payload, '$.process_context.active_ai_tools'))
+        WHERE ${where} AND event_type='commit'
+        GROUP BY 1 ORDER BY 2 DESC;" 2>/dev/null)"
+      if [[ -n "$tool_presence" ]]; then
+        while IFS='|' read -r tname tcount; do
+          md+="  - ${tname}: ${tcount} commits"$'\n'
+        done <<< "$tool_presence"
+      fi
+    fi
+
+    # Tier 3: AI artifacts present
+    local artifact_repo_count
+    artifact_repo_count="$(sqlite3 "$DB" "
+      SELECT COUNT(DISTINCT repo_name) FROM events
+      WHERE ${where} AND event_type='pre_commit'
+      AND json_extract(payload, '$.ai_artifacts') != '{}';" 2>/dev/null || echo 0)"
+    md+="- AI artifacts present: ${artifact_repo_count} repos"$'\n'
+
+    # Combined
+    local ai_combined
+    ai_combined="$(sqlite3 "$DB" "
+      SELECT COUNT(*) FROM events
+      WHERE ${where} AND event_type='commit' AND (
+        json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
+        OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0
+        OR repo_name IN (
+          SELECT DISTINCT repo_name FROM events
+          WHERE ${where} AND event_type='pre_commit'
+          AND json_extract(payload, '$.ai_artifacts') != '{}'
+        )
+      );" 2>/dev/null || echo 0)"
+    local combined_pct
+    combined_pct="$(awk "BEGIN { printf \"%.0f\", (${ai_combined}/${commits})*100 }")"
+    md+="- **Combined: ${ai_combined} / ${commits} commits (${combined_pct}%) had AI signatures**"$'\n'
   fi
   md+=""$'\n'
 
@@ -2024,11 +2140,159 @@ for n,v in sorted(seen.items(),key=lambda x:-x[1]['cost']):
   local system_prompt
   if [[ -n "$custom_prompt" ]]; then
     system_prompt="$custom_prompt"
+  elif [[ "$format" == "standup" ]]; then
+    system_prompt="$(_engsight_standup_prompt)"
+  elif [[ "$format" == "review" ]]; then
+    system_prompt="$(_engsight_review_prompt)"
   else
     system_prompt="$(_engsight_default_prompt)"
   fi
 
   echo "$md" | llm --system "$system_prompt"
+}
+
+# --- enrich command ---
+
+cmd_enrich() {
+  _engsight_check_db
+
+  if ! command -v gh >/dev/null 2>&1; then
+    echo "Error: 'gh' CLI is not installed. Install it with: brew install gh" >&2
+    exit 2
+  fi
+
+  local since="" until_date="" mode="weekly" repo_filter=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --daily)    mode="daily"; shift ;;
+      --weekly)   mode="weekly"; shift ;;
+      --since)    since="$2"; mode="custom"; shift 2 ;;
+      --until)    until_date="$2"; shift 2 ;;
+      --repo)     repo_filter="$2"; shift 2 ;;
+      -h|--help)  usage; exit 0 ;;
+      *)          echo "Unknown option: $1" >&2; exit 1 ;;
+    esac
+  done
+
+  case "$mode" in
+    daily)   since="$(_engsight_date_ago 0)"; until_date="$(_engsight_date_ago 0)" ;;
+    weekly)  since="$(_engsight_date_ago 7)"; until_date="$(_engsight_date_ago 0)" ;;
+    custom)
+      [[ -z "$since" ]] && { echo "Error: --since required" >&2; exit 1; }
+      [[ -z "$until_date" ]] && until_date="$(_engsight_date_ago 0)"
+      ;;
+  esac
+
+  local ts_start="${since}T00:00:00Z"
+  local ts_end="${until_date}T23:59:59Z"
+  local where="timestamp >= '${ts_start}' AND timestamp <= '${ts_end}'"
+  [[ -n "$repo_filter" ]] && where="${where} AND repo_name='${repo_filter}'"
+
+  # Get repos with push activity (they likely have remotes)
+  local repos_with_pushes
+  repos_with_pushes="$(sqlite3 "$DB" "
+    SELECT DISTINCT repo_name, repo_path
+    FROM events WHERE ${where} AND event_type='push'
+    ORDER BY repo_name;")"
+
+  if [[ -z "$repos_with_pushes" ]]; then
+    echo "No repos with push activity from ${since} to ${until_date}."
+    return
+  fi
+
+  echo "GitHub Enrichment: ${since} to ${until_date}"
+  printf "%s\n" "────────────────────────────────────────────────────────────────────"
+
+  while IFS='|' read -r rname rpath; do
+    [[ -z "$rname" ]] && continue
+
+    # Check if this repo has a GitHub remote
+    local gh_repo
+    gh_repo="$(cd "$rpath" 2>/dev/null && gh repo view --json nameWithOwner -q '.nameWithOwner' 2>/dev/null)" || continue
+
+    if [[ -z "$gh_repo" ]]; then continue; fi
+
+    echo ""
+    echo "${rname} (${gh_repo})"
+    printf "%s\n" "────────────────────────────────────────────"
+
+    # PRs authored in this period
+    local prs
+    prs="$(gh pr list --repo "$gh_repo" --author "@me" --state all \
+      --json number,title,state,createdAt,mergedAt,additions,deletions,reviewDecision,url \
+      --jq "[.[] | select(.createdAt >= \"${ts_start}\" and .createdAt <= \"${ts_end}\")]" 2>/dev/null)"
+
+    local pr_count
+    pr_count="$(echo "$prs" | python3 -c "import sys,json; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)"
+
+    if [[ "$pr_count" -gt 0 ]]; then
+      echo ""
+      echo "  Pull Requests Authored: ${pr_count}"
+
+      echo "$prs" | python3 -c "
+import sys, json
+prs = json.load(sys.stdin)
+for pr in prs:
+    state = pr['state'].lower()
+    if state == 'merged' or pr.get('mergedAt'):
+        state = 'merged'
+    review = pr.get('reviewDecision', '')
+    if review:
+        review = f' [{review.lower()}]'
+    adds = pr.get('additions', 0)
+    dels = pr.get('deletions', 0)
+    print(f\"  #{pr['number']} {pr['title']}\")
+    print(f\"    {state}{review}  +{adds}/-{dels}\")
+" 2>/dev/null
+    fi
+
+    # Reviews given in this period
+    local reviews_given
+    reviews_given="$(gh api "repos/${gh_repo}/pulls?state=all&per_page=50" 2>/dev/null | python3 -c "
+import sys, json, subprocess, os
+prs = json.load(sys.stdin)
+gh_user = subprocess.run(['gh', 'api', 'user', '-q', '.login'], capture_output=True, text=True).stdout.strip()
+count = 0
+for pr in prs:
+    if pr['user']['login'] == gh_user:
+        continue
+    # Check reviews
+    reviews_url = pr['_links']['self']['href'] + '/reviews'
+    try:
+        rv = subprocess.run(['gh', 'api', reviews_url], capture_output=True, text=True, timeout=5)
+        if rv.returncode == 0:
+            reviews = json.loads(rv.stdout)
+            for r in reviews:
+                if r['user']['login'] == gh_user and r.get('submitted_at', '') >= '${ts_start}':
+                    count += 1
+                    break
+    except:
+        pass
+print(count)
+" 2>/dev/null || echo 0)"
+
+    if [[ "$reviews_given" -gt 0 ]]; then
+      echo ""
+      printf "  Reviews Given: %d\n" "$reviews_given"
+    fi
+
+    # Local engsight stats for this repo
+    local local_commits local_pushes
+    local_commits="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND repo_name='${rname}' AND event_type='commit';")"
+    local_pushes="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND repo_name='${rname}' AND event_type='push';")"
+
+    echo ""
+    printf "  Local Activity: %d commits, %d pushes\n" "$local_commits" "$local_pushes"
+
+    # Commits-per-PR ratio
+    if [[ "$pr_count" -gt 0 && "$local_commits" -gt 0 ]]; then
+      local cpr
+      cpr="$(awk "BEGIN { printf \"%.1f\", ${local_commits}/${pr_count} }")"
+      printf "  Commits/PR: %s\n" "$cpr"
+    fi
+
+  done <<< "$repos_with_pushes"
 }
 
 # --- Main ---
@@ -2046,6 +2310,7 @@ case "$COMMAND" in
   patterns)   cmd_patterns "$@" ;;
   diff)       cmd_diff "$@" ;;
   narrate)    cmd_narrate "$@" ;;
+  enrich)     cmd_enrich "$@" ;;
   -h|--help|"") usage ;;
   *)
     echo "Unknown command: $COMMAND" >&2
