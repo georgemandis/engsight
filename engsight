@@ -1190,6 +1190,307 @@ cmd_patterns() {
   else
     printf "  • No non-main branch activity in this period\n"
   fi
+
+  # --- Commit-to-Push Latency ---
+  echo ""
+  echo "Commit-to-Push Latency"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  if [[ "$commits" -gt 0 ]]; then
+    # For each push, find how long since the most recent commit in that repo
+    local push_latency_data
+    push_latency_data="$(sqlite3 "$DB" "
+      SELECT p.repo_name,
+        CAST((julianday(p.timestamp) - julianday(
+          (SELECT MAX(c.timestamp) FROM events c
+           WHERE c.repo_name = p.repo_name AND c.event_type='commit'
+           AND c.timestamp < p.timestamp)
+        )) * 86400 AS INTEGER) as latency_seconds
+      FROM events p
+      WHERE p.event_type='push'
+        AND p.timestamp >= '${ts_start}' AND p.timestamp <= '${ts_end}'
+        AND latency_seconds IS NOT NULL AND latency_seconds > 0
+      ORDER BY latency_seconds;" 2>/dev/null)"
+
+    if [[ -n "$push_latency_data" ]]; then
+      local latency_values
+      latency_values="$(echo "$push_latency_data" | cut -d'|' -f2)"
+      local lat_count lat_min lat_max lat_avg lat_median
+      lat_count="$(echo "$latency_values" | wc -l | tr -d ' ')"
+      lat_min="$(echo "$latency_values" | head -1)"
+      lat_max="$(echo "$latency_values" | tail -1)"
+      lat_avg="$(echo "$latency_values" | awk '{ sum += $1; n++ } END { printf "%.0f", sum/n }')"
+      local lat_mid=$(( (lat_count + 1) / 2 ))
+      lat_median="$(echo "$latency_values" | sed -n "${lat_mid}p")"
+
+      printf "  • Pushes measured:      %d\n" "$lat_count"
+      printf "  • Median latency:       %s\n" "$(_engsight_format_duration "$lat_median")"
+      printf "  • Average latency:      %s\n" "$(_engsight_format_duration "$lat_avg")"
+      printf "  • Fastest push:         %s after commit\n" "$(_engsight_format_duration "$lat_min")"
+      printf "  • Slowest push:         %s after commit\n" "$(_engsight_format_duration "$lat_max")"
+    else
+      printf "  • No push events with prior commits to measure\n"
+    fi
+  else
+    printf "  • No commits in this period\n"
+  fi
+
+  # --- Rewrite Frequency ---
+  echo ""
+  echo "Rewrite Frequency"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  local rewrites amends rebases
+  rewrites="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='rewrite';")"
+  amends="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='rewrite' AND json_extract(payload, '$.action') = 'amend';" 2>/dev/null || echo 0)"
+  rebases="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='rewrite' AND json_extract(payload, '$.action') = 'rebase';" 2>/dev/null || echo 0)"
+
+  printf "  • Total rewrites:       %d\n" "$rewrites"
+  printf "  • Amends:               %d\n" "$amends"
+  printf "  • Rebases:              %d\n" "$rebases"
+  if [[ "$commits" -gt 0 && "$rewrites" -gt 0 ]]; then
+    local rewrite_pct
+    rewrite_pct="$(awk "BEGIN { printf \"%.0f\", (${rewrites}/${commits})*100 }")"
+    printf "  • Rewrite-to-commit:    %s%% (%d rewrites / %d commits)\n" "$rewrite_pct" "$rewrites" "$commits"
+  fi
+
+  # --- Commit Granularity ---
+  echo ""
+  echo "Commit Granularity"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  if [[ "$commits" -gt 0 ]]; then
+    # Files per commit
+    local files_per_commit
+    files_per_commit="$(sqlite3 "$DB" "
+      SELECT json_extract(payload, '$.files_changed')
+      FROM events WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.files_changed') IS NOT NULL
+      ORDER BY 1;" 2>/dev/null)"
+
+    if [[ -n "$files_per_commit" ]]; then
+      local fpc_count fpc_avg fpc_median fpc_max
+      fpc_count="$(echo "$files_per_commit" | wc -l | tr -d ' ')"
+      fpc_avg="$(echo "$files_per_commit" | awk '{ sum += $1; n++ } END { printf "%.1f", sum/n }')"
+      local fpc_mid=$(( (fpc_count + 1) / 2 ))
+      fpc_median="$(echo "$files_per_commit" | sed -n "${fpc_mid}p")"
+      fpc_max="$(echo "$files_per_commit" | tail -1)"
+
+      printf "  • Avg files/commit:     %s\n" "$fpc_avg"
+      printf "  • Median files/commit:  %s\n" "$fpc_median"
+      printf "  • Max files in commit:  %s\n" "$fpc_max"
+    fi
+
+    # Lines per commit (insertions + deletions)
+    local lines_data
+    lines_data="$(sqlite3 "$DB" "
+      SELECT COALESCE(json_extract(payload, '$.insertions'), 0) + COALESCE(json_extract(payload, '$.deletions'), 0)
+      FROM events WHERE ${where} AND event_type='commit'
+      ORDER BY 1;" 2>/dev/null)"
+
+    if [[ -n "$lines_data" ]]; then
+      local lpc_avg lpc_median lpc_max
+      lpc_avg="$(echo "$lines_data" | awk '{ sum += $1; n++ } END { printf "%.0f", sum/n }')"
+      local lpc_count
+      lpc_count="$(echo "$lines_data" | wc -l | tr -d ' ')"
+      local lpc_mid=$(( (lpc_count + 1) / 2 ))
+      lpc_median="$(echo "$lines_data" | sed -n "${lpc_mid}p")"
+      lpc_max="$(echo "$lines_data" | tail -1)"
+
+      printf "  • Avg lines/commit:     %s\n" "$lpc_avg"
+      printf "  • Median lines/commit:  %s\n" "$lpc_median"
+      printf "  • Max lines in commit:  %s\n" "$lpc_max"
+    fi
+
+    # Assessment
+    if [[ -n "$files_per_commit" ]]; then
+      local avg_float="$fpc_avg"
+      local avg_int
+      avg_int="$(awk "BEGIN { printf \"%.0f\", ${avg_float} }")"
+      if [[ "$avg_int" -le 3 ]]; then
+        printf "  • Assessment:           Atomic — small, focused commits\n"
+      elif [[ "$avg_int" -le 8 ]]; then
+        printf "  • Assessment:           Moderate — reasonable commit scope\n"
+      else
+        printf "  • Assessment:           Large — consider splitting commits\n"
+      fi
+    fi
+  fi
+
+  # --- Repo Ownership ---
+  echo ""
+  echo "Repo Ownership"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  if [[ "$commits" -gt 0 ]]; then
+    # Top repos by commit share
+    local repo_shares
+    repo_shares="$(sqlite3 "$DB" "
+      SELECT repo_name, COUNT(*) as repo_commits
+      FROM events WHERE ${where} AND event_type='commit'
+      GROUP BY repo_name ORDER BY repo_commits DESC
+      LIMIT 10;")"
+
+    if [[ -n "$repo_shares" ]]; then
+      printf "  %-25s %8s %8s\n" "Repo" "Commits" "Share"
+      echo "$repo_shares" | while IFS='|' read -r rname repo_commits; do
+        local share
+        share="$(awk "BEGIN { printf \"%.0f\", (${repo_commits}/${commits})*100 }")"
+        printf "  %-25s %8d %7s%%\n" "$rname" "$repo_commits" "$share"
+      done
+    fi
+
+    # How many repos account for 80% of commits?
+    local running_total=0 repos_for_80=0
+    local threshold=$(( commits * 80 / 100 ))
+    while IFS='|' read -r rname repo_commits; do
+      running_total=$(( running_total + repo_commits ))
+      repos_for_80=$(( repos_for_80 + 1 ))
+      if [[ "$running_total" -ge "$threshold" ]]; then break; fi
+    done <<< "$repo_shares"
+
+    echo ""
+    printf "  • %d repo(s) account for 80%% of commits\n" "$repos_for_80"
+    if [[ "$repos_for_80" -eq 1 ]]; then
+      printf "  • Assessment:           Specialist — deep in one repo\n"
+    elif [[ "$repos_for_80" -le 3 ]]; then
+      printf "  • Assessment:           Focused — a few primary repos\n"
+    else
+      printf "  • Assessment:           Generalist — spread across many repos\n"
+    fi
+  fi
+
+  # --- Session Shape ---
+  echo ""
+  echo "Session Shape"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  if [[ "$num_sessions" -gt 0 ]]; then
+    # For sessions with 3+ commits, determine if commits cluster early or late
+    local front_loaded=0 back_loaded=0 even=0 shape_sessions=0
+
+    # Re-walk events to analyze session shape
+    local shape_events
+    shape_events="$(sqlite3 "$DB" "SELECT timestamp, event_type, repo_name FROM events WHERE ${where} AND event_type='commit' ORDER BY timestamp ASC;")"
+
+    if [[ -n "$shape_events" ]]; then
+      # Reconstruct sessions again but track commit positions within each
+      local sh_start="" sh_prev_epoch=0 sh_commits_data=""
+
+      _analyze_shape() {
+        if [[ -z "$sh_commits_data" ]]; then return; fi
+        local count
+        count="$(echo "$sh_commits_data" | wc -l | tr -d ' ')"
+        if [[ "$count" -lt 3 ]]; then return; fi
+
+        shape_sessions=$(( shape_sessions + 1 ))
+        # Get first and last commit epochs
+        local first_epoch last_epoch
+        first_epoch="$(echo "$sh_commits_data" | head -1)"
+        last_epoch="$(echo "$sh_commits_data" | tail -1)"
+        local total_span=$(( last_epoch - first_epoch ))
+        if [[ "$total_span" -le 0 ]]; then
+          even=$(( even + 1 ))
+          return
+        fi
+
+        local midpoint=$(( first_epoch + total_span / 2 ))
+        local first_half=0 second_half=0
+        while read -r epoch; do
+          if [[ "$epoch" -le "$midpoint" ]]; then
+            first_half=$(( first_half + 1 ))
+          else
+            second_half=$(( second_half + 1 ))
+          fi
+        done <<< "$sh_commits_data"
+
+        if [[ "$first_half" -gt $(( second_half + 1 )) ]]; then
+          front_loaded=$(( front_loaded + 1 ))
+        elif [[ "$second_half" -gt $(( first_half + 1 )) ]]; then
+          back_loaded=$(( back_loaded + 1 ))
+        else
+          even=$(( even + 1 ))
+        fi
+      }
+
+      while IFS='|' read -r ts etype rname; do
+        local epoch
+        epoch="$(_engsight_to_epoch "$ts")"
+
+        if [[ -z "$sh_start" ]] || [[ $(( epoch - sh_prev_epoch )) -gt $gap_seconds ]]; then
+          _analyze_shape
+          sh_start="$ts"
+          sh_commits_data="$epoch"
+        else
+          sh_commits_data="${sh_commits_data}"$'\n'"${epoch}"
+        fi
+        sh_prev_epoch="$epoch"
+      done <<< "$shape_events"
+      _analyze_shape
+    fi
+
+    if [[ "$shape_sessions" -gt 0 ]]; then
+      printf "  Sessions with 3+ commits: %d\n" "$shape_sessions"
+      printf "  • Front-loaded (burst then done):  %d\n" "$front_loaded"
+      printf "  • Back-loaded (slow build):        %d\n" "$back_loaded"
+      printf "  • Even (steady throughout):        %d\n" "$even"
+    else
+      printf "  • Need sessions with 3+ commits to analyze shape\n"
+    fi
+  fi
+
+  # --- Process Context Trends ---
+  # Source config to check process sniff setting
+  if [[ -f "${ENGSIGHT_DIR}/config" ]]; then
+    source "${ENGSIGHT_DIR}/config" 2>/dev/null
+  fi
+  if [[ "${ENGSIGHT_PROCESS_SNIFF:-false}" == "true" || "${ENGSIGHT_PROCESS_SNIFF:-false}" == "deep" ]]; then
+    echo ""
+    echo "AI Tool Presence"
+    printf "%s\n" "────────────────────────────────────────────"
+
+    local tool_presence
+    tool_presence="$(sqlite3 "$DB" "
+      SELECT json_extract(value, '$.name') as tool_name,
+        COUNT(*) as appearances,
+        AVG(CAST(json_extract(value, '$.total_memory_mb') AS INTEGER)) as avg_mem,
+        MAX(CAST(json_extract(value, '$.max_uptime_seconds') AS INTEGER)) as max_uptime,
+        AVG(CAST(json_extract(value, '$.instances') AS REAL)) as avg_instances
+      FROM events,
+        json_each(json_extract(payload, '$.process_context.active_ai_tools'))
+      WHERE ${where} AND event_type='commit'
+      GROUP BY tool_name
+      ORDER BY appearances DESC;" 2>/dev/null)"
+
+    if [[ -n "$tool_presence" ]]; then
+      printf "  %-15s %8s %10s %12s %10s\n" "Tool" "Commits" "Avg Inst." "Avg Memory" "Max Uptime"
+      printf "  %-15s %8s %10s %12s %10s\n" "───────────────" "────────" "──────────" "────────────" "──────────"
+      echo "$tool_presence" | while IFS='|' read -r tool_name appearances avg_mem max_uptime avg_instances; do
+        local avg_inst_display avg_mem_display uptime_display
+        avg_inst_display="$(awk "BEGIN { printf \"%.1f\", ${avg_instances:-0} }")"
+        avg_mem_display="${avg_mem:-0}MB"
+        uptime_display="$(_engsight_format_duration "${max_uptime:-0}")"
+        printf "  %-15s %8d %10s %12s %10s\n" "$tool_name" "$appearances" "$avg_inst_display" "$avg_mem_display" "$uptime_display"
+      done
+
+      # What % of commits had AI tools running?
+      local commits_with_tools
+      commits_with_tools="$(sqlite3 "$DB" "
+        SELECT COUNT(*) FROM events
+        WHERE ${where} AND event_type='commit'
+        AND json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0;" 2>/dev/null || echo 0)"
+
+      if [[ "$commits" -gt 0 ]]; then
+        local presence_pct
+        presence_pct="$(awk "BEGIN { printf \"%.0f\", (${commits_with_tools}/${commits})*100 }")"
+        echo ""
+        printf "  • AI tools running during %d / %d commits (%s%%)\n" "$commits_with_tools" "$commits" "$presence_pct"
+        printf "  • (Note: tool running ≠ tool used — it may just be open)\n"
+      fi
+    else
+      printf "  • No process data captured yet\n"
+    fi
+  fi
 }
 
 # --- diff command ---
