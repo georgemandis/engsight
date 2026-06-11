@@ -57,10 +57,17 @@
 - [x] engleader.tools bridge: enrichment correlates local git data with same PR/review signals
 - [ ] Multi-machine sync (if relevant — let dogfooding determine need)
 
-## Blog Posts
+## Phase 5: Deeper AI Signal
 
-- [ ] **Post 1** (standalone): The git hooks footgun - `core.hooksPath` vs template directories
-- [ ] **Post 2** (after dogfooding): Introducing engsight - passive engineering self-awareness
+- [ ] **Transcript reading (Tier 4)** — Read Claude/Cursor/Copilot conversation files to extract richer signal than process sniffing: token counts, tool calls, conversation length, session duration. Adjacent to ccusage but pulling from raw transcript files rather than billing APIs.
+- [ ] **Acceptance rate** — Approximate "AI lines generated vs. lines kept" by correlating pre-commit state with post-amend/rebase activity. How often do you rewrite AI-generated commits?
+- [ ] **Model-level breakdown** — Extract which specific model (sonnet, opus, haiku, etc.) was used per commit, from Claude config or process args.
+- [ ] **Commit attribution visualization** — Post-commit hook output showing a human/AI contribution ratio. Quick visual gut-check on each commit.
+- [ ] **Session-level AI narrative** — Combine transcript data with commit/session data to answer "what was the AI doing during this session?" rather than just "was it running?"
+- [ ] **Attribution durability** — Track how long AI-associated code survives before being rewritten. Derive from existing file hotspot + rewrite frequency data without needing line-level tracking. Answers "does AI code stick or get reworked?"
+- [ ] **Agent checkpoint API** — Lightweight `engsight checkpoint` command that AI tools can optionally call to explicitly report what they did. Bridges passive observation and git-ai's deterministic approach. Not required — engsight stays useful without it.
+- [ ] **Git Notes export** — `engsight export-notes` writes key per-commit metrics (AI signature, session ID, tool presence) into git notes so attribution data can travel with repos and be visible in `git log --notes`.
+- [ ] **AI signature weighting** — Score the three tiers differently: explicit co-authorship (strong), process presence (medium), artifact presence (weak). Current combined percentage treats artifact-only repos the same as confirmed AI-assisted commits.
 
 ## Open Questions
 

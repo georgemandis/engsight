@@ -63,26 +63,28 @@ Git's `core.hooksPath` setting lets you set global hooks, but it **silently disa
 ## Install
 
 ```bash
+# Homebrew
+brew install georgemandis/tap/engsight
+
+# From source
 git clone https://github.com/georgemandis/engsight.git
 cd engsight
-./install.sh
+./engsight setup
 ```
 
-This creates `~/.engsight/`, initializes the database, and configures `init.templateDir`. New repos get hooks automatically after install.
-
-For existing repos:
+Then set up `~/.engsight/` (database, config, hooks) and install hooks in your repos:
 
 ```bash
-# Single repo
-~/.engsight/engsight init
-
-# All repos under a path
-~/.engsight/engsight init-all ~/Projects
+engsight setup
+engsight init-all ~/Projects
 ```
+
+New repos get hooks automatically after setup.
 
 ## Commands
 
 ```bash
+engsight setup         # Set up ~/.engsight (database, config, hooks)
 engsight init          # Install hooks in the current repo
 engsight init-all PATH # Install hooks in all git repos under PATH
 engsight status        # Show hook status and event count for current repo

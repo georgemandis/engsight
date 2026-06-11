@@ -7,10 +7,24 @@ HOOKS_SOURCE="${ENGSIGHT_DIR}/templates/hooks"
 
 DB="${ENGSIGHT_DIR}/engsight.db"
 
+# Resolve the directory where this script (and its sibling files) actually live.
+# Follows the Homebrew bin wrapper symlink/exec chain back to libexec.
+_engsight_resolve_source_dir() {
+  local source="${BASH_SOURCE[0]}"
+  while [[ -L "$source" ]]; do
+    local dir="$(cd "$(dirname "$source")" && pwd)"
+    source="$(readlink "$source")"
+    [[ "$source" != /* ]] && source="$dir/$source"
+  done
+  cd "$(dirname "$source")" && pwd
+}
+ENGSIGHT_SOURCE_DIR="$(_engsight_resolve_source_dir)"
+
 usage() {
   echo "Usage: engsight <command>"
   echo ""
   echo "Commands:"
+  echo "  setup            Set up ~/.engsight (database, config, hooks)"
   echo "  init             Install engsight hooks in the current repo"
   echo "  init-all PATH    Install engsight hooks in all repos under a path"
   echo "  status           Show engsight status for current repo"
@@ -72,6 +86,102 @@ usage() {
   echo "  --until DATE     Custom end date (YYYY-MM-DD, default: today)"
   echo "  --repo NAME      Filter by repo name"
   echo ""
+}
+
+cmd_setup() {
+  local src="$ENGSIGHT_SOURCE_DIR"
+
+  echo "Setting up engsight..."
+
+  # Create directory structure
+  mkdir -p "${ENGSIGHT_DIR}/templates/hooks"
+
+  # Copy config (don't overwrite existing)
+  if [[ ! -f "${ENGSIGHT_DIR}/config" ]]; then
+    cp "${src}/config.default" "${ENGSIGHT_DIR}/config"
+    echo "  Created ${ENGSIGHT_DIR}/config"
+  else
+    echo "  Config already exists at ${ENGSIGHT_DIR}/config (skipped)"
+  fi
+
+  # Copy common.sh
+  cp "${src}/common.sh" "${ENGSIGHT_DIR}/common.sh"
+  echo "  Installed common.sh"
+
+  # Initialize database
+  if [[ ! -f "${ENGSIGHT_DIR}/engsight.db" ]]; then
+    sqlite3 "${ENGSIGHT_DIR}/engsight.db" < "${src}/schema.sql"
+    echo "  Created database at ${ENGSIGHT_DIR}/engsight.db"
+  else
+    echo "  Database already exists (skipped)"
+  fi
+
+  # Copy hooks to templates
+  for hook in "${src}"/hooks/*; do
+    local hook_name
+    hook_name="$(basename "$hook")"
+    cp "$hook" "${ENGSIGHT_DIR}/templates/hooks/${hook_name}"
+    chmod +x "${ENGSIGHT_DIR}/templates/hooks/${hook_name}"
+  done
+  echo "  Installed hooks to ${ENGSIGHT_DIR}/templates/hooks/"
+
+  # Handle core.hooksPath (the footgun)
+  local hooks_path
+  hooks_path="$(git config --global core.hooksPath 2>/dev/null || echo "")"
+  if [[ -n "$hooks_path" ]]; then
+    hooks_path="${hooks_path/#\~/$HOME}"
+    echo ""
+    echo "  NOTICE: core.hooksPath is set to: ${hooks_path}"
+    echo "  Git ignores .git/hooks/ when this is set (the global hooks footgun)."
+    echo "  Installing engsight hooks there too, chaining to any existing hooks."
+    echo ""
+
+    mkdir -p "$hooks_path"
+    for hook in "${src}"/hooks/*; do
+      local hook_name
+      hook_name="$(basename "$hook")"
+      local hook_dest="${hooks_path}/${hook_name}"
+
+      if [[ -f "$hook_dest" ]]; then
+        if ! grep -q "engsight" "$hook_dest" 2>/dev/null; then
+          mv "$hook_dest" "${hook_dest}.local"
+          echo "  Renamed existing ${hook_name} -> ${hook_name}.local in hooksPath"
+        else
+          echo "  ${hook_name} already installed in hooksPath (skipped)"
+          continue
+        fi
+      fi
+
+      cp "$hook" "$hook_dest"
+      chmod +x "$hook_dest"
+      echo "  Installed ${hook_name} to hooksPath"
+    done
+  fi
+
+  # Set init.templateDir for new repos
+  local current_template
+  current_template="$(git config --global init.templateDir 2>/dev/null || echo "")"
+  if [[ -n "$current_template" && "$current_template" != "${ENGSIGHT_DIR}/templates" ]]; then
+    echo ""
+    echo "  WARNING: init.templateDir is already set to: ${current_template}"
+    echo "  engsight wants to set it to: ${ENGSIGHT_DIR}/templates"
+    echo ""
+    read -rp "  Overwrite? (y/N) " answer
+    if [[ "$answer" != [yY] ]]; then
+      echo "  Skipped setting init.templateDir. You can set it manually:"
+      echo "    git config --global init.templateDir ${ENGSIGHT_DIR}/templates"
+      echo ""
+      echo "Done! Run 'engsight init' inside existing repos to add hooks."
+      return
+    fi
+  fi
+
+  git config --global init.templateDir "${ENGSIGHT_DIR}/templates"
+  echo "  Set init.templateDir to ${ENGSIGHT_DIR}/templates"
+
+  echo ""
+  echo "Done! New repos will get engsight hooks automatically."
+  echo "For existing repos, run: engsight init"
 }
 
 cmd_init() {
@@ -214,7 +324,7 @@ _engsight_format_duration() {
 _engsight_check_db() {
   if [[ ! -f "$DB" ]]; then
     echo "Error: database not found at ${DB}" >&2
-    echo "Run install.sh first." >&2
+    echo "Run 'engsight setup' first." >&2
     exit 1
   fi
 }
@@ -2300,6 +2410,7 @@ COMMAND="${1:-}"
 [[ -n "$COMMAND" ]] && shift
 
 case "$COMMAND" in
+  setup)      cmd_setup ;;
   init)       cmd_init ;;
   init-all)   cmd_init_all "${1:-}" ;;
   status)     cmd_status ;;
