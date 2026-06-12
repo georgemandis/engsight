@@ -2,69 +2,19 @@
 
 Personal engineering metrics, collected passively via git hooks.
 
-engsight installs lightweight hooks across your repos that silently record commit metadata, branch switching patterns, AI tool usage, and other signals into a central SQLite database. It's designed for individual contributors who want to understand their own working patterns and communicate their work more effectively.
+engsight installs lightweight hooks across your repos that silently record commit metadata, branch switching, AI tool usage, and process context into a central SQLite database. No workflow changes. No cloud services. Just local data about how you actually work.
 
-Think of it as the IC complement to [engleader.tools](https://engleader.tools) — where engleader gives managers DORA metrics via GitHub's API, engsight gives you insight into your own process via local git events.
-
-## What it tracks
-
-Every git event is recorded with a JSON payload tailored to that event type:
-
-| Hook | What it captures |
-|------|-----------------|
-| **post-commit** | SHA, message, diff stats, file list, file types, AI co-author detection, AI artifact state, terminal context, working directory state, time-of-day |
-| **pre-commit** | Staged files, AI artifact shadow index (`.claude/`, `.cursor/`, `AGENTS.md`, etc.) |
-| **post-checkout** | Branch switches, new branch detection, context-switching patterns |
-| **post-merge** | Merge type, merged branch, files changed |
-| **pre-push** | Session boundaries — commits bundled between pushes |
-| **pre-rebase** | Pre-squash state capture (preserves commit granularity before history rewrite) |
-| **post-rewrite** | Amend/rebase tracking |
-
-All events include timestamps and repo identification, enabling cross-repo analysis.
-
-### AI awareness
-
-engsight treats AI tool usage as a first-class signal:
-
-- **Commit message scanning** — detects `Co-authored-by: Claude` and similar patterns
-- **Artifact shadow indexing** — tracks the state of `.claude/`, `.cursor/`, `AGENTS.md`, `CLAUDE.md`, and other AI tool files that live outside git history
-- **Process sniffing** (opt-in) — at commit time, checks if AI tools are running, how long they've been active, what files they have open, and what network connections they hold
-
-## How it works
-
-```
-~/.engsight/
-├── config          # Settings (AI artifacts to scan, process sniffing toggle, etc.)
-├── engsight.db     # Central SQLite database — all events across all repos
-├── common.sh       # Shared functions sourced by every hook
-└── templates/
-    └── hooks/      # Hook scripts, copied to new repos via init.templateDir
-```
-
-All data lives in a single `events` table with a JSON `payload` column:
-
-```sql
-SELECT event_type, repo_name, branch,
-       json_extract(payload, '$.files_changed') as files,
-       json_extract(payload, '$.terminal') as terminal
-FROM events
-ORDER BY timestamp DESC
-LIMIT 10;
-```
-
-### The git hooks footgun
-
-Git's `core.hooksPath` setting lets you set global hooks, but it **silently disables all local repo hooks**. engsight handles this by:
-
-1. Using `init.templateDir` for new repos (hooks are copied on `git init`/`git clone`)
-2. Detecting `core.hooksPath` during install and placing hooks there too
-3. Chaining to existing hooks via `<hookname>.local` — your repo-specific hooks still run
+It's the IC complement to [engleader.tools](https://engleader.tools) — where engleader gives managers DORA metrics via GitHub's API, engsight gives you the same class of insight from local git events: shipping cadence, iteration speed, recovery time, commit granularity, and AI collaboration patterns.
 
 ## Install
 
 ```bash
-# Homebrew
+# macOS (Homebrew)
 brew install georgemandis/tap/engsight
+
+# Windows (Scoop)
+scoop bucket add engsight https://github.com/georgemandis/scoop-bucket
+scoop install engsight
 
 # From source
 git clone https://github.com/georgemandis/engsight.git
@@ -72,26 +22,55 @@ cd engsight
 ./engsight setup
 ```
 
-Then set up `~/.engsight/` (database, config, hooks) and install hooks in your repos:
+After installing, set up the database and install hooks across your repos:
 
 ```bash
-engsight setup
-engsight init-all ~/Projects
+engsight setup                  # Creates ~/.engsight/ (database, config, hooks)
+engsight init-all ~/Projects    # Install hooks in all repos under a path
+engsight init                   # Or install in just the current repo
 ```
 
 New repos get hooks automatically after setup.
 
+## What it tracks
+
+Every git event is recorded with a JSON payload:
+
+| Hook | What it captures |
+|------|-----------------|
+| **post-commit** | SHA, message, diff stats, file list, file types, AI co-author detection, AI artifact state, process context, terminal, time-of-day |
+| **pre-commit** | Staged files, AI artifact shadow index (`.claude/`, `.cursor/`, `AGENTS.md`, etc.) |
+| **post-checkout** | Branch switches, new branch detection |
+| **post-merge** | Merge type, merged branch, files changed |
+| **pre-push** | Commits bundled between pushes |
+| **pre-rebase** | Pre-squash state capture |
+| **post-rewrite** | Amend/rebase tracking |
+
+### AI awareness
+
+engsight tracks AI involvement through three tiers, each weighted by signal strength:
+
+- **Co-authorship** (strong) — detects `Co-authored-by: Claude` and similar commit message patterns
+- **Process presence** (medium) — at commit time, checks if AI tools (Claude, Cursor, Copilot, Ollama, etc.) are running, with resource stats and uptime. Opt-in via config.
+- **Artifact presence** (weak) — tracks `.claude/`, `.cursor/`, `AGENTS.md`, `CLAUDE.md` and other AI tool files in the repo
+
+The combined AI confidence score weights these tiers (1.0 / 0.8 / 0.3) rather than treating them equally — a repo that merely contains a `CLAUDE.md` file isn't the same signal as a commit made while Claude was actively running.
+
 ## Commands
 
-```bash
-engsight setup         # Set up ~/.engsight (database, config, hooks)
-engsight init          # Install hooks in the current repo
-engsight init-all PATH # Install hooks in all git repos under PATH
-engsight status        # Show hook status and event count for current repo
-engsight log           # Show recent events across all repos
-engsight repos         # List repos with activity counts
-engsight summary       # Summarize activity for a time period
-engsight enrich        # Correlate local activity with GitHub PRs (requires gh)
+```
+engsight setup              Set up ~/.engsight (database, config, hooks)
+engsight init               Install hooks in the current repo
+engsight init-all PATH      Install hooks in all repos under PATH
+engsight status             Show hook status and event count for current repo
+engsight log                Recent events across all repos
+engsight repos              List repos ranked by activity
+engsight summary            Activity summary for a time period
+engsight sessions           Reconstruct work sessions from event clusters
+engsight patterns           Working patterns, DORA-shaped IC metrics
+engsight diff               Compare two time periods side-by-side
+engsight narrate            LLM-generated narrative of your activity
+engsight enrich             Correlate with GitHub PR data
 ```
 
 ### log
@@ -101,14 +80,7 @@ engsight log                          # Last 20 events across all repos
 engsight log --repo myproject         # Filter by repo
 engsight log --type commit            # Filter by event type
 engsight log --since 2025-01-15       # Events after a date
-engsight log --limit 50               # Show more events
-```
-
-### repos
-
-```bash
-engsight repos                        # All repos, sorted by event count
-engsight repos --since 2025-01-01     # Repos active since a date
+engsight log --limit 50              # Show more events
 ```
 
 ### summary
@@ -116,22 +88,20 @@ engsight repos --since 2025-01-01     # Repos active since a date
 ```bash
 engsight summary --daily              # Today's activity
 engsight summary --weekly             # Last 7 days (default)
-engsight summary --since 2025-01-01   # Custom start date
 engsight summary --since 2025-01-01 --until 2025-01-31  # Custom range
 ```
 
-The summary includes: repos touched, commit/push/merge/checkout counts, AI co-authorship breakdown by tool and pattern, AI artifact presence, and time-of-day/weekday patterns.
+Includes: repos touched, commit/push/merge counts, weighted AI signature breakdown (confirmed / likely / possible), and time-of-day patterns.
 
 ### sessions
 
 ```bash
 engsight sessions                     # Sessions from last 7 days
-engsight sessions --since 2025-01-01  # Sessions after a date
-engsight sessions --gap 60            # Use 60-minute gap threshold (default: 30)
+engsight sessions --gap 60            # 60-minute gap threshold (default: 30)
 engsight sessions --repo myproject    # Filter by repo
 ```
 
-Reconstructs work sessions by clustering events with gaps shorter than the threshold. Shows duration, commit count, branch switches, AI usage, and repos involved.
+Reconstructs work sessions by clustering events with time gaps. Shows duration, commits, branch switches, AI usage, and repos per session.
 
 ### patterns
 
@@ -141,7 +111,18 @@ engsight patterns --weekly            # Last 7 days (default)
 engsight patterns --since 2025-01-01  # Custom start date
 ```
 
-Surfaces working patterns: context switching frequency, commit cadence (median/average gap between commits), session depth (deep work vs. shallow), AI-assisted vs. solo session comparison, breadth of work (focus ratio, file type diversity, daily repo spread), commit streaks, file hotspots (with sole-author detection), and branch lifecycle stats.
+This is the big one. Surfaces DORA-shaped metrics adapted for individual contributors:
+
+| Section | What it measures | DORA analog |
+|---------|-----------------|-------------|
+| **Shipping Cadence** | Commits/day, pushes/day, commits/push, active day %, shipping style | Deployment Frequency |
+| **Iteration Speed** | Median/avg/min/max gap between commits in the same repo, pace assessment | Lead Time for Changes |
+| **Commit-to-Push Latency** | Time between commit and push (median, avg, min, max) | Lead Time for Changes |
+| **Recovery Time** | Fix/revert commit detection, time-to-fix, correction rate | Mean Time to Recovery |
+| **Rewrite Frequency** | Amend/rebase rate | Change Failure Rate |
+| **Commit Granularity** | Files/lines per commit (avg, median, max) | PR Size |
+
+Also includes: context switching frequency, session depth, AI correlation (AI vs solo sessions), breadth analysis, commit streaks, file hotspots with sole-author detection, branch lifecycle, repo ownership concentration, and session shape.
 
 ### diff
 
@@ -151,20 +132,34 @@ engsight diff --monthly               # This month vs last month
 engsight diff --period 2025-01-01..2025-01-31 2025-02-01..2025-02-28  # Custom
 ```
 
-Side-by-side comparison of two time periods: commits, pushes, repos, branches, AI co-author rate, and repo changes (new/dropped).
+Side-by-side comparison with deltas: commits, pushes, repos, branches, AI signature rate, and repo changes (new/dropped).
 
 ### narrate
 
 ```bash
-engsight narrate --daily              # LLM narrative of today
 engsight narrate --weekly             # LLM narrative of the week (default)
-engsight narrate --weekly --md        # Output raw markdown (no LLM needed)
-engsight narrate --daily --prompt "Write this as a standup update"
-engsight narrate --weekly --format standup   # Preset: standup update
-engsight narrate --weekly --format review    # Preset: performance review material
+engsight narrate --daily              # Today
+engsight narrate --format standup     # Preset: standup update
+engsight narrate --format review      # Preset: performance review material
+engsight narrate --prompt "Summarize as bullet points"  # Custom prompt
+engsight narrate --md                 # Raw markdown, no LLM
 ```
 
-Generates a structured markdown summary of your activity and pipes it to [llm](https://github.com/simonw/llm) for narrative generation. Use `--md` to get the raw markdown without the LLM step. Requires `llm` CLI unless using `--md`.
+Builds a structured markdown summary of your activity and pipes it to an LLM for narrative generation.
+
+**Requirements:** narrate uses Simon Willison's [llm](https://github.com/simonw/llm) CLI. Install it and configure any model:
+
+```bash
+# Install
+brew install llm          # or: pip install llm
+
+# Then pick a backend — any of these work:
+llm keys set openai       # OpenAI (GPT-4, etc.)
+llm install llm-claude-3  # Anthropic Claude
+llm install llm-ollama    # Ollama (local, no API key needed)
+```
+
+Whatever model you have set as your `llm` default is what narrate uses. Use `--md` to skip the LLM step entirely and get raw markdown.
 
 ### enrich
 
@@ -174,38 +169,45 @@ engsight enrich --daily               # Today's GitHub activity
 engsight enrich --repo myproject      # Filter by repo
 ```
 
-Correlates local git activity with GitHub PR data: PRs authored, reviews given, commits-per-PR ratio. Requires `gh` CLI authenticated with GitHub.
+Correlates local git activity with GitHub PR data: PRs authored, reviews given, commits-per-PR ratio. Requires [`gh`](https://cli.github.com/) CLI authenticated with GitHub.
 
 ## Configuration
 
 Edit `~/.engsight/config` to customize:
 
-- **AI artifacts to scan** — add paths for new AI tools as they appear
-- **Commit message patterns** — detect AI co-authorship signals
-- **Process sniffing** — disabled by default, enable with `ENGSIGHT_PROCESS_SNIFF=true`
-- **Excluded repos** — skip repos you don't want to track
-- **Terminal/workdir/time capture** — all enabled by default
+```bash
+ENGSIGHT_PROCESS_SNIFF=false    # Set to "true" or "deep" to detect AI tools at commit time
+ENGSIGHT_EXCLUDE_REPOS=()      # Repos to skip
+ENGSIGHT_CAPTURE_TERMINAL=true  # Record terminal app
+ENGSIGHT_CAPTURE_WORKDIR_STATE=true
+ENGSIGHT_CAPTURE_TIME=true
+```
+
+Process sniffing tiers:
+
+| Value | What it does | Overhead |
+|-------|-------------|----------|
+| `false` | Disabled (default) | — |
+| `true` | Detects AI tools via `pgrep`/`ps`, reports instances + CPU + memory + uptime | ~50ms |
+| `deep` | Also scans open files and network connections via `lsof` | ~200ms |
+
+## AI cost tracking
+
+If you use [ccusage](https://github.com/yohasebe/ccusage), engsight queries it at report time to include token usage and cost data in `patterns` and `narrate` output — total cost, token breakdown, cost per commit, and model-level detail. No configuration needed; if `ccusage` (or `bunx ccusage`) is available, it's included automatically.
 
 ## MCP Server
 
-engsight includes an MCP (Model Context Protocol) server that lets Claude Code query your engineering data directly. This enables natural language queries like "what did I work on last Tuesday?" or "how does this week compare to last?".
+engsight includes an MCP server that lets Claude Code query your engineering data conversationally.
 
 ### Setup
 
 Requires [Bun](https://bun.sh).
 
 ```bash
-cd mcp
+cd /path/to/engsight/mcp
 bun install
-```
-
-Add to Claude Code with the CLI:
-
-```bash
 claude mcp add engsight -s user -- bun run /path/to/engsight/mcp/index.ts
 ```
-
-The `-s user` flag makes it available globally across all projects. Use `-s project` instead to scope it to a single repo.
 
 ### Available tools
 
@@ -213,49 +215,54 @@ The `-s user` flag makes it available globally across all projects. Use `-s proj
 |------|-------------|
 | `engsight_log` | Recent events across all repos |
 | `engsight_repos` | Repos with activity counts |
-| `engsight_summary` | Activity summary for a time period |
+| `engsight_summary` | Activity summary with weighted AI signatures |
 | `engsight_sessions` | Work session reconstruction |
-| `engsight_patterns` | Working patterns and insights |
+| `engsight_patterns` | Working patterns and DORA-shaped metrics |
 | `engsight_diff` | Compare two time periods |
-| `engsight_query` | Raw SQL escape hatch |
+| `engsight_query` | Raw SQL against the events table |
 
-## Querying the data
+## Querying directly
 
-You can also query the SQLite database directly:
+The SQLite database is yours to query:
 
 ```bash
-# What repos have I been active in today?
+# Repos active today
 sqlite3 ~/.engsight/engsight.db \
   "SELECT DISTINCT repo_name FROM events WHERE date(timestamp) = date('now');"
 
-# How many commits per repo this week?
+# Commits per repo this week
 sqlite3 ~/.engsight/engsight.db \
   "SELECT repo_name, COUNT(*) FROM events
    WHERE event_type='commit' AND timestamp > datetime('now', '-7 days')
    GROUP BY repo_name ORDER BY 2 DESC;"
 
-# Which commits had AI co-authors?
+# Commits with AI tools running
 sqlite3 ~/.engsight/engsight.db \
-  "SELECT repo_name, json_extract(payload, '$.message'), json_extract(payload, '$.ai_commit_signals.co_authored_by')
+  "SELECT repo_name, json_extract(payload, '$.message')
    FROM events WHERE event_type='commit'
-   AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';"
-
-# Context switching: how many branch switches today?
-sqlite3 ~/.engsight/engsight.db \
-  "SELECT repo_name, json_extract(payload, '$.previous_branch'), json_extract(payload, '$.new_branch')
-   FROM events WHERE event_type='checkout' AND date(timestamp) = date('now');"
+   AND json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0;"
 ```
+
+## The git hooks footgun
+
+Git's `core.hooksPath` lets you set global hooks, but it **silently disables all local repo hooks**. engsight handles this by:
+
+1. Using `init.templateDir` for new repos (hooks copied on `git init`/`git clone`)
+2. Detecting `core.hooksPath` during install and placing hooks there too
+3. Chaining to existing hooks via `<hookname>.local` — your repo-specific hooks still run
 
 ## Design principles
 
 - **Never block git** — hooks fail silently, never interfere with your workflow
 - **Store everything, refine later** — capture all data now, discover what's useful through dogfooding
-- **Local-first** — no network calls, no platform dependency, works offline
-- **Configurable defaults** — ships with sensible AI artifact list, fully customizable
+- **Local-first** — no network calls, no cloud dependency, works offline
+- **Weighted signals** — not all AI indicators are equal; score them accordingly
 - **Opt-in for invasive features** — process sniffing is off by default
 
 ## Roadmap
 
-See [ROADMAP.md](ROADMAP.md) for what's next: query CLI, MCP server, AI-powered summaries, GitHub enrichment, and more.
+See [ROADMAP.md](ROADMAP.md) for what's next, and [docs/DESIGN.md](docs/DESIGN.md) for the full design spec including all payload schemas.
 
-See [docs/DESIGN.md](docs/DESIGN.md) for the full design spec including all payload schemas.
+## License
+
+MIT
