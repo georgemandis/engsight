@@ -636,23 +636,37 @@ cmd_summary() {
       done
     fi
 
-    # Combined: any AI signal
-    local ai_combined
-    ai_combined="$(sqlite3 "$DB" "
+    # Combined: weighted AI signal
+    # Co-authorship=1.0 (confirmed), process=0.8 (strong), artifact=0.3 (weak)
+    local ai_confirmed ai_likely ai_possible
+    ai_confirmed="$(sqlite3 "$DB" "
       SELECT COUNT(*) FROM events
       WHERE ${where} AND event_type='commit' AND (
         json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
-        OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0
-        OR repo_name IN (
-          SELECT DISTINCT repo_name FROM events
-          WHERE ${where} AND event_type='pre_commit'
-          AND json_extract(payload, '$.ai_artifacts') != '{}'
-        )
       );" 2>/dev/null || echo 0)"
-    local combined_pct
-    combined_pct="$(awk "BEGIN { printf \"%.0f\", (${ai_combined}/${commits})*100 }")"
+    ai_likely="$(sqlite3 "$DB" "
+      SELECT COUNT(*) FROM events
+      WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.ai_commit_signals.co_authored_by') = '[]'
+      AND json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0;" 2>/dev/null || echo 0)"
+    ai_possible="$(sqlite3 "$DB" "
+      SELECT COUNT(*) FROM events
+      WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.ai_commit_signals.co_authored_by') = '[]'
+      AND (json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) IS NULL
+           OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) = 0)
+      AND repo_name IN (
+        SELECT DISTINCT repo_name FROM events
+        WHERE ${where} AND event_type='pre_commit'
+        AND json_extract(payload, '$.ai_artifacts') != '{}'
+      );" 2>/dev/null || echo 0)"
+    local weighted_score
+    weighted_score="$(awk "BEGIN { printf \"%.0f\", ((${ai_confirmed}*1.0 + ${ai_likely}*0.8 + ${ai_possible}*0.3) / ${commits})*100 }")"
     echo ""
-    printf "  Combined: %d / %d commits (%s%%) had AI signatures\n" "$ai_combined" "$commits" "$combined_pct"
+    printf "  Combined (weighted):      %s%% AI confidence\n" "$weighted_score"
+    printf "    confirmed (co-author):  %d commits\n" "$ai_confirmed"
+    printf "    likely (tool running):  %d commits\n" "$ai_likely"
+    printf "    possible (artifacts):   %d commits\n" "$ai_possible"
   else
     printf "  • No commits to analyze\n"
   fi
@@ -774,11 +788,11 @@ cmd_sessions() {
 
     if [[ "$etype" == "commit" ]]; then
       s_commits=$(( s_commits + 1 ))
-      # AI signature: any of co-authorship, process presence, or artifact presence
+      # AI signature: co-authorship (confirmed) or process presence (likely)
+      # Artifact-only is too weak to flag individual commits/sessions
       local has_ai=false
       if [[ -n "$ai_coauthors" && "$ai_coauthors" != "[]" ]]; then has_ai=true; fi
       if [[ "${ai_tool_count:-0}" -gt 0 ]]; then has_ai=true; fi
-      if echo "$artifact_repos" | grep -qx "$rname" 2>/dev/null; then has_ai=true; fi
       if [[ "$has_ai" == "true" ]]; then
         s_ai_commits=$(( s_ai_commits + 1 ))
       fi
@@ -942,11 +956,11 @@ cmd_patterns() {
     if [[ "$etype" == "commit" ]]; then
       s_commits=$(( s_commits + 1 ))
       s_files=$(( s_files + ${files_changed:-0} ))
-      # AI signature: any of co-authorship, process presence, or artifact presence
+      # AI signature: co-authorship (confirmed) or process presence (likely)
+      # Artifact-only is too weak to flag individual commits/sessions
       local has_ai=false
       if [[ -n "$ai_coauthors" && "$ai_coauthors" != "[]" ]]; then has_ai=true; fi
       if [[ "${ai_tool_count:-0}" -gt 0 ]]; then has_ai=true; fi
-      if echo "$artifact_repos" | grep -qx "$rname" 2>/dev/null; then has_ai=true; fi
       if [[ "$has_ai" == "true" ]]; then
         s_ai_commits=$(( s_ai_commits + 1 ))
       fi
@@ -1419,6 +1433,154 @@ cmd_patterns() {
     printf "  • No commits in this period\n"
   fi
 
+  # --- Shipping Cadence (Deployment Frequency analog) ---
+  echo ""
+  echo "Shipping Cadence"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  if [[ "$commits" -gt 0 ]]; then
+    local period_days
+    period_days="$(sqlite3 "$DB" "SELECT CAST(julianday('${until_date}') - julianday('${since}') + 1 AS INTEGER);")"
+    [[ "$period_days" -lt 1 ]] && period_days=1
+
+    local active_days pushes_total
+    active_days="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT date(timestamp)) FROM events WHERE ${where} AND event_type='commit';")"
+    pushes_total="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='push';")"
+
+    local commits_per_day pushes_per_day active_pct
+    commits_per_day="$(awk "BEGIN { printf \"%.1f\", ${commits}/${period_days} }")"
+    pushes_per_day="$(awk "BEGIN { printf \"%.1f\", ${pushes_total}/${period_days} }")"
+    active_pct="$(awk "BEGIN { printf \"%.0f\", (${active_days}/${period_days})*100 }")"
+
+    printf "  • Commits/day:          %s (over %d days)\n" "$commits_per_day" "$period_days"
+    printf "  • Pushes/day:           %s\n" "$pushes_per_day"
+    printf "  • Active days:          %d / %d (%s%%)\n" "$active_days" "$period_days" "$active_pct"
+
+    # Push-to-commit ratio: how often do you batch vs ship immediately?
+    if [[ "$pushes_total" -gt 0 ]]; then
+      local commits_per_push
+      commits_per_push="$(awk "BEGIN { printf \"%.1f\", ${commits}/${pushes_total} }")"
+      printf "  • Commits/push:         %s\n" "$commits_per_push"
+      local cpp_int
+      cpp_int="$(awk "BEGIN { printf \"%.0f\", ${commits}/${pushes_total} }")"
+      if [[ "$cpp_int" -le 1 ]]; then
+        printf "  • Style:                Ship-as-you-go\n"
+      elif [[ "$cpp_int" -le 3 ]]; then
+        printf "  • Style:                Small batches\n"
+      else
+        printf "  • Style:                Batch shipper\n"
+      fi
+    fi
+  fi
+
+  # --- Iteration Speed (feedback loop tightness) ---
+  echo ""
+  echo "Iteration Speed"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  if [[ "$commits" -gt 1 ]]; then
+    # Time between successive commits in the same repo
+    local iter_data
+    iter_data="$(sqlite3 "$DB" "
+      SELECT CAST((julianday(e.timestamp) - julianday(
+        (SELECT MAX(c.timestamp) FROM events c
+         WHERE c.repo_name = e.repo_name AND c.event_type='commit'
+         AND c.timestamp < e.timestamp)
+      )) * 86400 AS INTEGER) as gap_seconds
+      FROM events e
+      WHERE ${where} AND e.event_type='commit'
+      AND gap_seconds IS NOT NULL AND gap_seconds > 0
+      ORDER BY gap_seconds;" 2>/dev/null)"
+
+    if [[ -n "$iter_data" ]]; then
+      local iter_count iter_avg iter_median
+      iter_count="$(echo "$iter_data" | wc -l | tr -d ' ')"
+      iter_avg="$(echo "$iter_data" | awk '{ sum += $1; n++ } END { printf "%.0f", sum/n }')"
+      local iter_mid=$(( (iter_count + 1) / 2 ))
+      iter_median="$(echo "$iter_data" | sed -n "${iter_mid}p")"
+      local iter_min iter_max
+      iter_min="$(echo "$iter_data" | head -1)"
+      iter_max="$(echo "$iter_data" | tail -1)"
+
+      printf "  • Median gap between commits: %s\n" "$(_engsight_format_duration "$iter_median")"
+      printf "  • Average gap:                %s\n" "$(_engsight_format_duration "$iter_avg")"
+      printf "  • Tightest iteration:         %s\n" "$(_engsight_format_duration "$iter_min")"
+      printf "  • Longest gap:                %s\n" "$(_engsight_format_duration "$iter_max")"
+
+      local med_minutes=$(( iter_median / 60 ))
+      if [[ "$med_minutes" -le 10 ]]; then
+        printf "  • Pace:                       Rapid — tight feedback loops\n"
+      elif [[ "$med_minutes" -le 30 ]]; then
+        printf "  • Pace:                       Steady — focused sessions\n"
+      elif [[ "$med_minutes" -le 120 ]]; then
+        printf "  • Pace:                       Deliberate — thinking between commits\n"
+      else
+        printf "  • Pace:                       Sparse — long gaps between commits\n"
+      fi
+    else
+      printf "  • Not enough sequential commits to measure\n"
+    fi
+  else
+    printf "  • Need 2+ commits to measure iteration speed\n"
+  fi
+
+  # --- Recovery Time (MTTR analog) ---
+  echo ""
+  echo "Recovery Time"
+  printf "%s\n" "────────────────────────────────────────────"
+
+  if [[ "$commits" -gt 0 ]]; then
+    # Time from a fix/revert commit to the previous commit in that repo
+    # "fix" = commit message starts with "fix" or contains "fix:" or "hotfix" or "revert"
+    local fix_latencies
+    fix_latencies="$(sqlite3 "$DB" "
+      SELECT CAST((julianday(e.timestamp) - julianday(
+        (SELECT MAX(c.timestamp) FROM events c
+         WHERE c.repo_name = e.repo_name AND c.event_type='commit'
+         AND c.timestamp < e.timestamp)
+      )) * 86400 AS INTEGER) as fix_gap
+      FROM events e
+      WHERE ${where} AND e.event_type='commit'
+      AND (
+        LOWER(json_extract(e.payload, '$.message')) LIKE 'fix%'
+        OR LOWER(json_extract(e.payload, '$.message')) LIKE '%fix:%'
+        OR LOWER(json_extract(e.payload, '$.message')) LIKE '%hotfix%'
+        OR LOWER(json_extract(e.payload, '$.message')) LIKE '%revert%'
+        OR LOWER(json_extract(e.payload, '$.message')) LIKE '%bugfix%'
+      )
+      AND fix_gap IS NOT NULL AND fix_gap > 0
+      ORDER BY fix_gap;" 2>/dev/null)"
+
+    local fix_count=0
+    if [[ -n "$fix_latencies" ]]; then
+      fix_count="$(echo "$fix_latencies" | wc -l | tr -d ' ')"
+    fi
+
+    # Also count rewrite events as "recovery" signals
+    local rewrites_count
+    rewrites_count="$(sqlite3 "$DB" "SELECT COUNT(*) FROM events WHERE ${where} AND event_type='rewrite';")"
+
+    local total_fixes=$(( fix_count + rewrites_count ))
+    printf "  • Fix/revert commits:   %d\n" "$fix_count"
+    printf "  • Rewrites (amend/rebase): %d\n" "$rewrites_count"
+
+    if [[ "$fix_count" -gt 0 ]]; then
+      local fix_avg fix_median
+      fix_avg="$(echo "$fix_latencies" | awk '{ sum += $1; n++ } END { printf "%.0f", sum/n }')"
+      local fix_mid=$(( (fix_count + 1) / 2 ))
+      fix_median="$(echo "$fix_latencies" | sed -n "${fix_mid}p")"
+
+      printf "  • Median time to fix:   %s (from prior commit)\n" "$(_engsight_format_duration "$fix_median")"
+      printf "  • Average time to fix:  %s\n" "$(_engsight_format_duration "$fix_avg")"
+    fi
+
+    if [[ "$commits" -gt 0 ]]; then
+      local fix_rate
+      fix_rate="$(awk "BEGIN { printf \"%.0f\", (${total_fixes}/${commits})*100 }")"
+      printf "  • Correction rate:      %s%% of commits are fixes/rewrites\n" "$fix_rate"
+    fi
+  fi
+
   # --- Rewrite Frequency ---
   echo ""
   echo "Rewrite Frequency"
@@ -1755,11 +1917,6 @@ _engsight_period_stats() {
     WHERE ${where} AND event_type='commit' AND (
       json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
       OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0
-      OR repo_name IN (
-        SELECT DISTINCT repo_name FROM events
-        WHERE ${where} AND event_type='pre_commit'
-        AND json_extract(payload, '$.ai_artifacts') != '{}'
-      )
     );" 2>/dev/null || echo 0)"
   active_days="$(sqlite3 "$DB" "SELECT COUNT(DISTINCT date(timestamp)) FROM events WHERE ${where};")"
 
@@ -2066,22 +2223,31 @@ cmd_narrate() {
       AND json_extract(payload, '$.ai_artifacts') != '{}';" 2>/dev/null || echo 0)"
     md+="- AI artifacts present: ${artifact_repo_count} repos"$'\n'
 
-    # Combined
-    local ai_combined
-    ai_combined="$(sqlite3 "$DB" "
+    # Combined (weighted)
+    local n_confirmed n_likely n_possible
+    n_confirmed="$(sqlite3 "$DB" "
       SELECT COUNT(*) FROM events
-      WHERE ${where} AND event_type='commit' AND (
-        json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
-        OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0
-        OR repo_name IN (
-          SELECT DISTINCT repo_name FROM events
-          WHERE ${where} AND event_type='pre_commit'
-          AND json_extract(payload, '$.ai_artifacts') != '{}'
-        )
+      WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]';" 2>/dev/null || echo 0)"
+    n_likely="$(sqlite3 "$DB" "
+      SELECT COUNT(*) FROM events
+      WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.ai_commit_signals.co_authored_by') = '[]'
+      AND json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0;" 2>/dev/null || echo 0)"
+    n_possible="$(sqlite3 "$DB" "
+      SELECT COUNT(*) FROM events
+      WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.ai_commit_signals.co_authored_by') = '[]'
+      AND (json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) IS NULL
+           OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) = 0)
+      AND repo_name IN (
+        SELECT DISTINCT repo_name FROM events
+        WHERE ${where} AND event_type='pre_commit'
+        AND json_extract(payload, '$.ai_artifacts') != '{}'
       );" 2>/dev/null || echo 0)"
-    local combined_pct
-    combined_pct="$(awk "BEGIN { printf \"%.0f\", (${ai_combined}/${commits})*100 }")"
-    md+="- **Combined: ${ai_combined} / ${commits} commits (${combined_pct}%) had AI signatures**"$'\n'
+    local weighted_pct
+    weighted_pct="$(awk "BEGIN { printf \"%.0f\", ((${n_confirmed}*1.0 + ${n_likely}*0.8 + ${n_possible}*0.3) / ${commits})*100 }")"
+    md+="- **AI confidence: ${weighted_pct}% (confirmed: ${n_confirmed}, likely: ${n_likely}, possible: ${n_possible})**"$'\n'
   fi
   md+=""$'\n'
 

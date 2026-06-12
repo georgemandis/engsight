@@ -200,16 +200,30 @@ server.tool(
       AND json_extract(payload, '$.ai_artifacts') != '{}'
     `).all();
 
-    const aiCombined = db.query(`
+    // Weighted AI signature: confirmed (co-author=1.0), likely (process=0.8), possible (artifact=0.3)
+    const aiConfirmed = db.query(`
       SELECT COUNT(*) as c FROM events
-      WHERE ${where} AND event_type='commit' AND (
-        json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
-        OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0
-        OR repo_name IN (
-          SELECT DISTINCT repo_name FROM events
-          WHERE ${where} AND event_type='pre_commit'
-          AND json_extract(payload, '$.ai_artifacts') != '{}'
-        )
+      WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
+    `).get() as any;
+
+    const aiLikely = db.query(`
+      SELECT COUNT(*) as c FROM events
+      WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.ai_commit_signals.co_authored_by') = '[]'
+      AND json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0
+    `).get() as any;
+
+    const aiPossible = db.query(`
+      SELECT COUNT(*) as c FROM events
+      WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.ai_commit_signals.co_authored_by') = '[]'
+      AND (json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) IS NULL
+           OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) = 0)
+      AND repo_name IN (
+        SELECT DISTINCT repo_name FROM events
+        WHERE ${where} AND event_type='pre_commit'
+        AND json_extract(payload, '$.ai_artifacts') != '{}'
       )
     `).get() as any;
 
@@ -234,9 +248,13 @@ server.tool(
         ai_tools_running: { commits: aiProcess.c, tools: aiToolBreakdown },
         ai_artifacts_present: { repos: aiArtifactRepos.map((r: any) => r.repo_name) },
         combined: {
-          commits: aiCombined.c,
+          confirmed: aiConfirmed.c,
+          likely: aiLikely.c,
+          possible: aiPossible.c,
           total_commits: overview.commits,
-          percentage: overview.commits > 0 ? Math.round((aiCombined.c / overview.commits) * 100) : 0,
+          weighted_percentage: overview.commits > 0
+            ? Math.round(((aiConfirmed.c * 1.0 + aiLikely.c * 0.8 + aiPossible.c * 0.3) / overview.commits) * 100)
+            : 0,
         },
       },
       time_patterns: timePatterns,
@@ -331,10 +349,10 @@ server.tool(
 
       if (row.event_type === "commit") {
         session.commits++;
-        // AI signature: any of co-authorship, process presence, or artifact presence
+        // AI signature: co-authorship (confirmed) or process presence (likely)
+        // Artifact-only is too weak to flag individual commits/sessions
         const hasAi = (row.ai_coauthors && row.ai_coauthors !== "[]")
-          || (row.ai_tool_count > 0)
-          || artifactRepos.has(row.repo_name);
+          || (row.ai_tool_count > 0);
         if (hasAi) session.ai_commits++;
       }
       if (row.event_type === "checkout") session.checkouts++;
@@ -434,16 +452,30 @@ server.tool(
       ) WHERE latency IS NOT NULL AND latency > 0
     `).get() as any;
 
-    const aiCombined = db.query(`
+    // Weighted AI signatures
+    const pAiConfirmed = db.query(`
       SELECT COUNT(*) as c FROM events
-      WHERE ${where} AND event_type='commit' AND (
-        json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
-        OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0
-        OR repo_name IN (
-          SELECT DISTINCT repo_name FROM events
-          WHERE ${where} AND event_type='pre_commit'
-          AND json_extract(payload, '$.ai_artifacts') != '{}'
-        )
+      WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
+    `).get() as any;
+
+    const pAiLikely = db.query(`
+      SELECT COUNT(*) as c FROM events
+      WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.ai_commit_signals.co_authored_by') = '[]'
+      AND json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0
+    `).get() as any;
+
+    const pAiPossible = db.query(`
+      SELECT COUNT(*) as c FROM events
+      WHERE ${where} AND event_type='commit'
+      AND json_extract(payload, '$.ai_commit_signals.co_authored_by') = '[]'
+      AND (json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) IS NULL
+           OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) = 0)
+      AND repo_name IN (
+        SELECT DISTINCT repo_name FROM events
+        WHERE ${where} AND event_type='pre_commit'
+        AND json_extract(payload, '$.ai_artifacts') != '{}'
       )
     `).get() as any;
 
@@ -473,9 +505,13 @@ server.tool(
         avg_human: formatDuration(Math.round(pushLatency.avg_latency)),
       } : null,
       ai_signatures: {
-        commits_with_ai: aiCombined.c,
+        confirmed: pAiConfirmed.c,
+        likely: pAiLikely.c,
+        possible: pAiPossible.c,
         total_commits: overview.commits,
-        percentage: overview.commits > 0 ? Math.round((aiCombined.c / overview.commits) * 100) : 0,
+        weighted_percentage: overview.commits > 0
+          ? Math.round(((pAiConfirmed.c * 1.0 + pAiLikely.c * 0.8 + pAiPossible.c * 0.3) / overview.commits) * 100)
+          : 0,
       },
       focus: topRepo ? {
         top_repo: topRepo.repo_name,
@@ -545,16 +581,12 @@ server.tool(
         FROM events WHERE ${w}
       `).get() as any;
 
-      const aiSignatures = db.query(`
+      // Weighted AI signatures: confirmed+likely only for diff counts
+      const aiConfirmedDiff = db.query(`
         SELECT COUNT(*) as c FROM events
         WHERE ${w} AND event_type='commit' AND (
           json_extract(payload, '$.ai_commit_signals.co_authored_by') != '[]'
           OR json_array_length(json_extract(payload, '$.process_context.active_ai_tools')) > 0
-          OR repo_name IN (
-            SELECT DISTINCT repo_name FROM events
-            WHERE ${w} AND event_type='pre_commit'
-            AND json_extract(payload, '$.ai_artifacts') != '{}'
-          )
         )
       `).get() as any;
 
@@ -565,8 +597,8 @@ server.tool(
       return {
         period: { start, end },
         ...stats,
-        ai_signature_commits: aiSignatures.c,
-        ai_signature_percentage: stats.commits > 0 ? Math.round((aiSignatures.c / stats.commits) * 100) : 0,
+        ai_signature_commits: aiConfirmedDiff.c,
+        ai_signature_percentage: stats.commits > 0 ? Math.round((aiConfirmedDiff.c / stats.commits) * 100) : 0,
         repo_list: repoList,
       };
     }
