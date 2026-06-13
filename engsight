@@ -2571,6 +2571,248 @@ print(count)
   done <<< "$repos_with_pushes"
 }
 
+cmd_completions() {
+  local shell="${1:-}"
+  case "$shell" in
+    bash)
+      cat <<'BASH_COMPLETIONS'
+# engsight completions for bash
+# Install: eval "$(engsight completions bash)"
+# Persist: engsight completions bash > /etc/bash_completion.d/engsight
+
+_engsight() {
+    local cur prev words cword
+    _init_completion || return
+
+    local commands="setup init init-all status log repos summary sessions patterns diff narrate enrich completions help"
+
+    if [[ $cword -eq 1 ]]; then
+        COMPREPLY=($(compgen -W "$commands --help -h" -- "$cur"))
+        return
+    fi
+
+    local cmd="${words[1]}"
+
+    case "$cmd" in
+        log)
+            COMPREPLY=($(compgen -W "--repo --type --since --limit" -- "$cur"))
+            ;;
+        repos)
+            COMPREPLY=($(compgen -W "--since" -- "$cur"))
+            ;;
+        summary)
+            COMPREPLY=($(compgen -W "--daily --weekly --since --until" -- "$cur"))
+            ;;
+        sessions)
+            COMPREPLY=($(compgen -W "--since --until --gap --repo --limit" -- "$cur"))
+            ;;
+        patterns)
+            COMPREPLY=($(compgen -W "--daily --weekly --since --until" -- "$cur"))
+            ;;
+        diff)
+            COMPREPLY=($(compgen -W "--weekly --monthly --period" -- "$cur"))
+            ;;
+        narrate)
+            COMPREPLY=($(compgen -W "--daily --weekly --since --until --md --prompt --format" -- "$cur"))
+            ;;
+        enrich)
+            COMPREPLY=($(compgen -W "--daily --weekly --since --until --repo" -- "$cur"))
+            ;;
+        completions)
+            COMPREPLY=($(compgen -W "bash zsh fish" -- "$cur"))
+            ;;
+    esac
+}
+
+complete -F _engsight engsight
+BASH_COMPLETIONS
+      ;;
+    zsh)
+      cat <<'ZSH_COMPLETIONS'
+#compdef engsight
+# engsight completions for zsh
+# Install: engsight completions zsh | source /dev/stdin
+# Persist: engsight completions zsh > ~/.zfunc/_engsight && fpath+=(~/.zfunc)
+
+_engsight() {
+    local -a commands
+    commands=(
+        'setup:Set up ~/.engsight'
+        'init:Install hooks in current repo'
+        'init-all:Install hooks in all repos under a path'
+        'status:Show engsight status for current repo'
+        'log:Show recent events'
+        'repos:List repos with activity counts'
+        'summary:Summarize activity for a time period'
+        'sessions:Reconstruct work sessions'
+        'patterns:Surface working patterns'
+        'diff:Compare activity between periods'
+        'narrate:Generate LLM narrative'
+        'enrich:Correlate with GitHub PR data'
+        'completions:Generate shell completions'
+        'help:Show help message'
+    )
+
+    _arguments -C \
+        '1:command:->command' \
+        '*::arg:->args'
+
+    case "$state" in
+        command)
+            _describe 'command' commands
+            ;;
+        args)
+            case "$words[1]" in
+                log)
+                    _arguments \
+                        '--repo[Filter by repo name]:name:' \
+                        '--type[Filter by event type]:type:' \
+                        '--since[Events after date]:date:' \
+                        '--limit[Max events]:n:'
+                    ;;
+                repos)
+                    _arguments '--since[Activity after date]:date:'
+                    ;;
+                summary)
+                    _arguments \
+                        '--daily[Summarize today]' \
+                        '--weekly[Summarize last 7 days]' \
+                        '--since[Start date]:date:' \
+                        '--until[End date]:date:'
+                    ;;
+                sessions)
+                    _arguments \
+                        '--since[Sessions after date]:date:' \
+                        '--until[Sessions before date]:date:' \
+                        '--gap[Gap threshold in minutes]:minutes:' \
+                        '--repo[Filter by repo]:name:' \
+                        '--limit[Max sessions]:n:'
+                    ;;
+                patterns)
+                    _arguments \
+                        '--daily[Analyze today]' \
+                        '--weekly[Analyze last 7 days]' \
+                        '--since[Start date]:date:' \
+                        '--until[End date]:date:'
+                    ;;
+                diff)
+                    _arguments \
+                        '--weekly[This week vs last week]' \
+                        '--monthly[This month vs last month]' \
+                        '--period[Custom periods]:period:'
+                    ;;
+                narrate)
+                    _arguments \
+                        '--daily[Narrate today]' \
+                        '--weekly[Narrate last 7 days]' \
+                        '--since[Start date]:date:' \
+                        '--until[End date]:date:' \
+                        '--md[Output raw markdown]' \
+                        '--prompt[Override system prompt]:text:' \
+                        '--format[Preset prompt format]:format:(standup review)'
+                    ;;
+                enrich)
+                    _arguments \
+                        '--daily[Enrich today]' \
+                        '--weekly[Enrich last 7 days]' \
+                        '--since[Start date]:date:' \
+                        '--until[End date]:date:' \
+                        '--repo[Filter by repo]:name:'
+                    ;;
+                completions)
+                    _arguments '1:shell:(bash zsh fish)'
+                    ;;
+            esac
+            ;;
+    esac
+}
+
+_engsight "$@"
+ZSH_COMPLETIONS
+      ;;
+    fish)
+      cat <<'FISH_COMPLETIONS'
+# engsight completions for fish
+# Install: engsight completions fish | source
+# Persist: engsight completions fish > ~/.config/fish/completions/engsight.fish
+
+complete -e -c engsight
+complete -c engsight -f
+complete -c engsight -n "__fish_use_subcommand" -a "setup" -d "Set up ~/.engsight"
+complete -c engsight -n "__fish_use_subcommand" -a "init" -d "Install hooks in current repo"
+complete -c engsight -n "__fish_use_subcommand" -a "init-all" -d "Install hooks in all repos under a path"
+complete -c engsight -n "__fish_use_subcommand" -a "status" -d "Show engsight status"
+complete -c engsight -n "__fish_use_subcommand" -a "log" -d "Show recent events"
+complete -c engsight -n "__fish_use_subcommand" -a "repos" -d "List repos with activity"
+complete -c engsight -n "__fish_use_subcommand" -a "summary" -d "Summarize activity"
+complete -c engsight -n "__fish_use_subcommand" -a "sessions" -d "Reconstruct work sessions"
+complete -c engsight -n "__fish_use_subcommand" -a "patterns" -d "Surface working patterns"
+complete -c engsight -n "__fish_use_subcommand" -a "diff" -d "Compare activity between periods"
+complete -c engsight -n "__fish_use_subcommand" -a "narrate" -d "Generate LLM narrative"
+complete -c engsight -n "__fish_use_subcommand" -a "enrich" -d "Correlate with GitHub PR data"
+complete -c engsight -n "__fish_use_subcommand" -a "completions" -d "Generate shell completions"
+complete -c engsight -n "__fish_use_subcommand" -a "help" -d "Show help"
+
+# log options
+complete -c engsight -n "__fish_seen_subcommand_from log" -l repo -r -d "Filter by repo"
+complete -c engsight -n "__fish_seen_subcommand_from log" -l type -r -d "Filter by event type"
+complete -c engsight -n "__fish_seen_subcommand_from log" -l since -r -d "Events after date"
+complete -c engsight -n "__fish_seen_subcommand_from log" -l limit -r -d "Max events"
+
+# repos options
+complete -c engsight -n "__fish_seen_subcommand_from repos" -l since -r -d "Activity after date"
+
+# summary options
+complete -c engsight -n "__fish_seen_subcommand_from summary" -l daily -d "Summarize today"
+complete -c engsight -n "__fish_seen_subcommand_from summary" -l weekly -d "Summarize last 7 days"
+complete -c engsight -n "__fish_seen_subcommand_from summary" -l since -r -d "Start date"
+complete -c engsight -n "__fish_seen_subcommand_from summary" -l until -r -d "End date"
+
+# sessions options
+complete -c engsight -n "__fish_seen_subcommand_from sessions" -l since -r -d "Sessions after date"
+complete -c engsight -n "__fish_seen_subcommand_from sessions" -l until -r -d "Sessions before date"
+complete -c engsight -n "__fish_seen_subcommand_from sessions" -l gap -r -d "Gap threshold minutes"
+complete -c engsight -n "__fish_seen_subcommand_from sessions" -l repo -r -d "Filter by repo"
+complete -c engsight -n "__fish_seen_subcommand_from sessions" -l limit -r -d "Max sessions"
+
+# patterns options
+complete -c engsight -n "__fish_seen_subcommand_from patterns" -l daily -d "Analyze today"
+complete -c engsight -n "__fish_seen_subcommand_from patterns" -l weekly -d "Analyze last 7 days"
+complete -c engsight -n "__fish_seen_subcommand_from patterns" -l since -r -d "Start date"
+complete -c engsight -n "__fish_seen_subcommand_from patterns" -l until -r -d "End date"
+
+# diff options
+complete -c engsight -n "__fish_seen_subcommand_from diff" -l weekly -d "This week vs last"
+complete -c engsight -n "__fish_seen_subcommand_from diff" -l monthly -d "This month vs last"
+complete -c engsight -n "__fish_seen_subcommand_from diff" -l period -r -d "Custom periods"
+
+# narrate options
+complete -c engsight -n "__fish_seen_subcommand_from narrate" -l daily -d "Narrate today"
+complete -c engsight -n "__fish_seen_subcommand_from narrate" -l weekly -d "Narrate last 7 days"
+complete -c engsight -n "__fish_seen_subcommand_from narrate" -l since -r -d "Start date"
+complete -c engsight -n "__fish_seen_subcommand_from narrate" -l until -r -d "End date"
+complete -c engsight -n "__fish_seen_subcommand_from narrate" -l md -d "Output raw markdown"
+complete -c engsight -n "__fish_seen_subcommand_from narrate" -l prompt -r -d "Override system prompt"
+complete -c engsight -n "__fish_seen_subcommand_from narrate" -l format -r -d "Preset prompt format"
+
+# enrich options
+complete -c engsight -n "__fish_seen_subcommand_from enrich" -l daily -d "Enrich today"
+complete -c engsight -n "__fish_seen_subcommand_from enrich" -l weekly -d "Enrich last 7 days"
+complete -c engsight -n "__fish_seen_subcommand_from enrich" -l since -r -d "Start date"
+complete -c engsight -n "__fish_seen_subcommand_from enrich" -l until -r -d "End date"
+complete -c engsight -n "__fish_seen_subcommand_from enrich" -l repo -r -d "Filter by repo"
+
+# completions sub-targets
+complete -c engsight -n "__fish_seen_subcommand_from completions" -a "bash zsh fish" -d "Shell type"
+FISH_COMPLETIONS
+      ;;
+    *)
+      echo "Error: unsupported shell '$shell'. Use bash, zsh, or fish" >&2
+      exit 1
+      ;;
+  esac
+}
+
 # --- Main ---
 COMMAND="${1:-}"
 [[ -n "$COMMAND" ]] && shift
@@ -2588,6 +2830,7 @@ case "$COMMAND" in
   diff)       cmd_diff "$@" ;;
   narrate)    cmd_narrate "$@" ;;
   enrich)     cmd_enrich "$@" ;;
+  completions) cmd_completions "${1:-}" ;;
   -h|--help|"") usage ;;
   *)
     echo "Unknown command: $COMMAND" >&2
